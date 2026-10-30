@@ -9,57 +9,42 @@
 #include <algorithm>
 #include <vector>
 #include <string>
-#include <string_view>
 #include <thread>
+#include <mutex>
 
 // Pre-computed hour ISO strings: 72 hours from 2026-10-30T18:00:00Z to 2026-11-02T17:00:00Z
 static char g_hour_strings[72][24];
 
 static void init_hour_strings() {
-    int hour_idx = 0;
-    // 2026-10-30: hours 18..23
-    for (int h = 18; h <= 23; h++) {
-        snprintf(g_hour_strings[hour_idx++], sizeof(g_hour_strings[0]), "2026-10-30T%02d:00:00Z", h);
-    }
-    // 2026-10-31: hours 0..23
-    for (int h = 0; h <= 23; h++) {
-        snprintf(g_hour_strings[hour_idx++], sizeof(g_hour_strings[0]), "2026-10-31T%02d:00:00Z", h);
-    }
-    // 2026-11-01: hours 0..23
-    for (int h = 0; h <= 23; h++) {
-        snprintf(g_hour_strings[hour_idx++], sizeof(g_hour_strings[0]), "2026-11-01T%02d:00:00Z", h);
-    }
-    // 2026-11-02: hours 0..17
-    for (int h = 0; h <= 17; h++) {
-        snprintf(g_hour_strings[hour_idx++], sizeof(g_hour_strings[0]), "2026-11-02T%02d:00:00Z", h);
-    }
+    int idx = 0;
+    for (int h = 18; h <= 23; h++) snprintf(g_hour_strings[idx++], 24, "2026-10-30T%02d:00:00Z", h);
+    for (int h = 0; h <= 23; h++)  snprintf(g_hour_strings[idx++], 24, "2026-10-31T%02d:00:00Z", h);
+    for (int h = 0; h <= 23; h++)  snprintf(g_hour_strings[idx++], 24, "2026-11-01T%02d:00:00Z", h);
+    for (int h = 0; h <= 17; h++)  snprintf(g_hour_strings[idx++], 24, "2026-11-02T%02d:00:00Z", h);
 }
 
 // Fast decode of hour_idx from timestamp prefix: YYYY-MM-DDTHH...
-// 27-byte timestamp: 2026-10-30T18:00:00.000000Z
 static inline int parse_hour_idx(const uint8_t *ts) {
     int day_offset = 0;
     if (ts[5] == '1' && ts[6] == '0') {
-        // Month 10
         if (ts[8] == '3') {
             if (ts[9] == '0') day_offset = 0;
-            else day_offset = 1; // 31
+            else day_offset = 1;
         }
     } else {
-        // Month 11
-        if (ts[9] == '1') day_offset = 2; // 01
-        else day_offset = 3; // 02
+        if (ts[9] == '1') day_offset = 2;
+        else day_offset = 3;
     }
     int hh = (ts[11] - '0') * 10 + (ts[12] - '0');
     return day_offset * 24 + hh - 18;
 }
 
-// Global interned endpoints catalogue (up to 2048 distinct endpoints)
+// Global endpoints catalogue
 static constexpr size_t MAX_ENDPOINTS = 2048;
 static std::string g_endpoint_strings[MAX_ENDPOINTS];
 static size_t g_num_endpoints = 0;
+static std::mutex g_ep_mutex;
 
-// Flat hash map for endpoint interning
 struct EndpointEntry {
     uint64_t hash;
     const char *str;
@@ -67,7 +52,7 @@ struct EndpointEntry {
     uint16_t id;
 };
 
-static constexpr size_t EP_MAP_CAP = 8192;
+static constexpr size_t EP_MAP_CAP = 16384;
 static constexpr size_t EP_MAP_MASK = EP_MAP_CAP - 1;
 static EndpointEntry g_ep_map[EP_MAP_CAP];
 
@@ -89,6 +74,18 @@ static uint16_t get_or_insert_endpoint(const char *p, size_t len) {
         }
         idx = (idx + 1) & EP_MAP_MASK;
     }
+
+    // Miss: lock and insert
+    std::lock_guard<std::mutex> lock(g_ep_mutex);
+    // Double check
+    idx = h & EP_MAP_MASK;
+    while (g_ep_map[idx].str != nullptr) {
+        if (g_ep_map[idx].hash == h && g_ep_map[idx].len == len &&
+            memcmp(g_ep_map[idx].str, p, len) == 0) {
+            return g_ep_map[idx].id;
+        }
+        idx = (idx + 1) & EP_MAP_MASK;
+    }
     uint16_t id = g_num_endpoints++;
     g_endpoint_strings[id] = std::string(p, len);
     g_ep_map[idx].hash = h;
@@ -98,15 +95,43 @@ static uint16_t get_or_insert_endpoint(const char *p, size_t len) {
     return id;
 }
 
-// Group accumulators
-struct GroupData {
-    std::vector<uint32_t> latencies;
-    uint32_t count = 0;
-    uint32_t errors = 0;
+static inline char* fast_u32(char *p, uint32_t v) {
+    if (v == 0) { *p++ = '0'; return p; }
+    char buf[12];
+    int i = 0;
+    while (v > 0) {
+        buf[i++] = (v % 10) + '0';
+        v /= 10;
+    }
+    while (i > 0) *p++ = buf[--i];
+    return p;
+}
+
+static inline char* fast_u64(char *p, uint64_t v) {
+    if (v == 0) { *p++ = '0'; return p; }
+    char buf[24];
+    int i = 0;
+    while (v > 0) {
+        buf[i++] = (v % 10) + '0';
+        v /= 10;
+    }
+    while (i > 0) *p++ = buf[--i];
+    return p;
+}
+
+static constexpr size_t TOTAL_GROUPS = 72 * MAX_ENDPOINTS; // 147,456
+
+struct RawRecord {
+    uint32_t group_id;
+    uint32_t lat;
 };
 
-// 72 hours * MAX_ENDPOINTS
-static GroupData g_groups[72][MAX_ENDPOINTS];
+struct ThreadData {
+    std::vector<RawRecord> records;
+    uint32_t counts[TOTAL_GROUPS];
+    uint32_t errors[TOTAL_GROUPS];
+    uint32_t write_offset[TOTAL_GROUPS];
+};
 
 int main(int argc, char **argv) {
     const char *data_dir = "/data";
@@ -126,10 +151,7 @@ int main(int argc, char **argv) {
     snprintf(input_path, sizeof(input_path), "%s/requests.log", data_dir);
 
     int fd = open(input_path, O_RDONLY);
-    if (fd < 0) {
-        perror("open input");
-        return 1;
-    }
+    if (fd < 0) { perror("open input"); return 1; }
 
     struct stat st;
     fstat(fd, &st);
@@ -143,105 +165,188 @@ int main(int argc, char **argv) {
     }
     madvise((void *)data, file_size, MADV_SEQUENTIAL | MADV_WILLNEED);
 
-    const uint8_t *p = data;
-    const uint8_t *end = data + file_size;
+    unsigned int num_threads = std::thread::hardware_concurrency();
+    if (num_threads == 0) num_threads = 4;
 
-    while (p < end) {
-        // Line format: ts SP method SP endpoint SP status SP latency LF
-        // ts: 27 bytes
-        int hour_idx = parse_hour_idx(p);
-        p += 28; // skip ts and space
+    std::vector<const uint8_t *> chunk_starts(num_threads);
+    std::vector<const uint8_t *> chunk_ends(num_threads);
 
-        // Skip method
-        while (*p != ' ') p++;
-        p++; // skip space
-
-        // Endpoint
-        const char *ep_start = (const char *)p;
-        while (*p != ' ') p++;
-        size_t ep_len = (const char *)p - ep_start;
-        p++; // skip space
-
-        uint16_t ep_id = get_or_insert_endpoint(ep_start, ep_len);
-
-        // Status: 3 digits
-        int status = (p[0] - '0') * 100 + (p[1] - '0') * 10 + (p[2] - '0');
-        bool is_error = (status >= 500 && status <= 599);
-        p += 4; // 3 digits + space
-
-        // Latency: integer
-        uint32_t lat = 0;
-        while (*p >= '0' && *p <= '9') {
-            lat = lat * 10 + (*p - '0');
-            p++;
+    for (unsigned int i = 0; i < num_threads; i++) {
+        size_t s = (i * file_size) / num_threads;
+        if (i > 0) {
+            while (s < file_size && data[s - 1] != '\n') s++;
         }
-        if (*p == '\r') p++;
-        if (*p == '\n') p++;
+        chunk_starts[i] = data + s;
+        if (i > 0) {
+            chunk_ends[i - 1] = chunk_starts[i];
+        }
+    }
+    chunk_ends[num_threads - 1] = data + file_size;
 
-        // Accumulate into group
-        GroupData &g = g_groups[hour_idx][ep_id];
-        g.count++;
-        if (is_error) g.errors++;
-        g.latencies.push_back(lat);
+    std::vector<ThreadData> tdata(num_threads);
+    std::vector<std::thread> workers;
+
+    // Pass 1: Parse chunks in parallel
+    for (unsigned int t = 0; t < num_threads; t++) {
+        tdata[t].records.reserve((file_size / num_threads) / 60);
+        workers.emplace_back([t, &tdata, &chunk_starts, &chunk_ends]() {
+            const uint8_t *p = chunk_starts[t];
+            const uint8_t *end = chunk_ends[t];
+            auto &td = tdata[t];
+
+            while (p < end) {
+                int hour_idx = parse_hour_idx(p);
+                p += 28; // ts + space
+
+                while (*p != ' ') p++;
+                p++; // skip method
+
+                const char *ep_start = (const char *)p;
+                while (*p != ' ') p++;
+                size_t ep_len = (const char *)p - ep_start;
+                p++;
+
+                uint16_t ep_id = get_or_insert_endpoint(ep_start, ep_len);
+
+                bool is_error = (p[0] == '5');
+                p += 4; // 3 status digits + space
+
+                uint32_t lat = 0;
+                while (*p >= '0' && *p <= '9') {
+                    lat = lat * 10 + (*p - '0');
+                    p++;
+                }
+                if (*p == '\r') p++;
+                if (*p == '\n') p++;
+
+                uint32_t g_idx = ((uint32_t)hour_idx << 11) | (uint32_t)ep_id;
+                td.counts[g_idx]++;
+                if (is_error) td.errors[g_idx]++;
+                td.records.push_back({g_idx, lat});
+            }
+        });
     }
 
-    // Sort endpoints lexicographically to output in exact specification order
-    // Order: hour ascending, then endpoint ascending as unsigned bytes
+    for (auto &w : workers) w.join();
+    workers.clear();
+
+    // Pass 1.5: Compute total counts, error sums, and prefix sum
+    std::vector<uint32_t> total_counts(TOTAL_GROUPS, 0);
+    std::vector<uint32_t> total_errors(TOTAL_GROUPS, 0);
+    std::vector<uint32_t> group_offset(TOTAL_GROUPS + 1, 0);
+
+    for (size_t g = 0; g < TOTAL_GROUPS; g++) {
+        uint32_t c = 0;
+        uint32_t err = 0;
+        for (unsigned int t = 0; t < num_threads; t++) {
+            tdata[t].write_offset[g] = c;
+            c += tdata[t].counts[g];
+            err += tdata[t].errors[g];
+        }
+        total_counts[g] = c;
+        total_errors[g] = err;
+    }
+
+    uint32_t total_records = 0;
+    for (size_t g = 0; g < TOTAL_GROUPS; g++) {
+        group_offset[g] = total_records;
+        total_records += total_counts[g];
+    }
+    group_offset[TOTAL_GROUPS] = total_records;
+
+    // Adjust each thread's write_offset with group_offset[g]
+    for (size_t g = 0; g < TOTAL_GROUPS; g++) {
+        uint32_t base = group_offset[g];
+        for (unsigned int t = 0; t < num_threads; t++) {
+            tdata[t].write_offset[g] += base;
+        }
+    }
+
+    // Pass 2: Scatter latencies into global flat array in parallel
+    std::vector<uint32_t> all_latencies(total_records);
+    for (unsigned int t = 0; t < num_threads; t++) {
+        workers.emplace_back([t, &tdata, &all_latencies]() {
+            auto &td = tdata[t];
+            for (const auto &r : td.records) {
+                uint32_t pos = td.write_offset[r.group_id]++;
+                all_latencies[pos] = r.lat;
+            }
+        });
+    }
+    for (auto &w : workers) w.join();
+    workers.clear();
+
+    // Sort endpoints lexicographically
     std::vector<uint16_t> sorted_endpoint_ids(g_num_endpoints);
-    for (size_t i = 0; i < g_num_endpoints; i++) {
-        sorted_endpoint_ids[i] = (uint16_t)i;
-    }
+    for (size_t i = 0; i < g_num_endpoints; i++) sorted_endpoint_ids[i] = (uint16_t)i;
     std::sort(sorted_endpoint_ids.begin(), sorted_endpoint_ids.end(), [](uint16_t a, uint16_t b) {
         return g_endpoint_strings[a] < g_endpoint_strings[b];
     });
 
+    // Pass 3: Process hours in parallel
+    mkdir(out_dir, 0777);
     char out_path[1024];
     snprintf(out_path, sizeof(out_path), "%s/summary.txt", out_dir);
 
-    // Create dir if needed
-    mkdir(out_dir, 0777);
+    std::vector<std::string> hour_outputs(72);
+    for (unsigned int t = 0; t < num_threads; t++) {
+        workers.emplace_back([t, num_threads, &hour_outputs, &sorted_endpoint_ids,
+                              &group_offset, &total_counts, &total_errors, &all_latencies]() {
+            char line_buf[256];
+            for (int h = t; h < 72; h += num_threads) {
+                std::string &out = hour_outputs[h];
+                out.reserve(128 * 1024);
+                const char *h_str = g_hour_strings[h];
+                for (uint16_t ep_id : sorted_endpoint_ids) {
+                    uint32_t g_idx = ((uint32_t)h << 11) | (uint32_t)ep_id;
+                    uint32_t n = total_counts[g_idx];
+                    if (n == 0) continue;
 
-    FILE *out = fopen(out_path, "wb");
-    if (!out) {
-        perror("fopen out");
-        return 1;
+                    uint32_t start_pos = group_offset[g_idx];
+                    uint32_t *lats = &all_latencies[start_pos];
+                    std::sort(lats, lats + n);
+
+                    uint32_t rank50 = (50 * n + 99) / 100;
+                    uint32_t rank95 = (95 * n + 99) / 100;
+                    uint32_t rank99 = (99 * n + 99) / 100;
+
+                    uint32_t p50 = lats[rank50 - 1];
+                    uint32_t p95 = lats[rank95 - 1];
+                    uint32_t p99 = lats[rank99 - 1];
+
+                    uint32_t errs = total_errors[g_idx];
+                    uint64_t ppm = (uint64_t)errs * 1000000ULL / n;
+
+                    char *cur = line_buf;
+                    memcpy(cur, h_str, 20); cur += 20;
+                    *cur++ = ' ';
+                    const std::string &ep_s = g_endpoint_strings[ep_id];
+                    memcpy(cur, ep_s.data(), ep_s.size()); cur += ep_s.size();
+                    *cur++ = ' ';
+                    cur = fast_u32(cur, n); *cur++ = ' ';
+                    cur = fast_u32(cur, p50); *cur++ = ' ';
+                    cur = fast_u32(cur, p95); *cur++ = ' ';
+                    cur = fast_u32(cur, p99); *cur++ = ' ';
+                    cur = fast_u32(cur, errs); *cur++ = ' ';
+                    cur = fast_u64(cur, ppm); *cur++ = '\n';
+                    out.append(line_buf, cur - line_buf);
+                }
+            }
+        });
     }
+    for (auto &w : workers) w.join();
+    workers.clear();
 
-    // Set large 1MB stream write buffer
+    FILE *fout = fopen(out_path, "wb");
+    if (!fout) { perror("fopen"); return 1; }
     char *out_buf = (char *)malloc(1024 * 1024);
-    setvbuf(out, out_buf, _IOFBF, 1024 * 1024);
-
+    setvbuf(fout, out_buf, _IOFBF, 1024 * 1024);
     for (int h = 0; h < 72; h++) {
-        const char *h_str = g_hour_strings[h];
-        for (uint16_t ep_id : sorted_endpoint_ids) {
-            GroupData &g = g_groups[h][ep_id];
-            if (g.count == 0) continue;
-
-            std::sort(g.latencies.begin(), g.latencies.end());
-
-            uint32_t n = g.count;
-            // 1-indexed rank: (p * n + 99) / 100
-            uint32_t rank50 = (50 * n + 99) / 100;
-            uint32_t rank95 = (95 * n + 99) / 100;
-            uint32_t rank99 = (99 * n + 99) / 100;
-
-            uint32_t p50 = g.latencies[rank50 - 1];
-            uint32_t p95 = g.latencies[rank95 - 1];
-            uint32_t p99 = g.latencies[rank99 - 1];
-
-            uint64_t ppm = (uint64_t)g.errors * 1000000ULL / n;
-
-            fprintf(out, "%s %s %u %u %u %u %u %llu\n",
-                    h_str,
-                    g_endpoint_strings[ep_id].c_str(),
-                    n,
-                    p50, p95, p99,
-                    g.errors,
-                    (unsigned long long)ppm);
+        if (!hour_outputs[h].empty()) {
+            fwrite(hour_outputs[h].data(), 1, hour_outputs[h].size(), fout);
         }
     }
-
-    fclose(out);
+    fclose(fout);
     free(out_buf);
     munmap((void *)data, file_size);
     close(fd);
