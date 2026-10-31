@@ -75,7 +75,7 @@ public:
 };
 
 struct DistMap {
-    static constexpr size_t CAP = 131072;
+    static constexpr size_t CAP = 65536;
     static constexpr size_t MASK = CAP - 1;
     static constexpr uint32_t EMPTY = 0xFFFFFFFF;
 
@@ -269,6 +269,7 @@ int main(int argc, char **argv) {
     std::vector<std::atomic<uint32_t>>().swap(b_cur);
 
     // Unmap graph.txt immediately
+    madvise((void *)g_data, g_size, MADV_DONTNEED);
     munmap((void *)g_data, g_size);
     close(g_fd);
 
@@ -297,6 +298,7 @@ int main(int argc, char **argv) {
         if (p < q_end && *p == '\n') p++;
         queries.push_back(q_item);
     }
+    madvise((void *)q_data, q_size, MADV_DONTNEED);
     munmap((void *)q_data, q_size);
     close(q_fd);
 

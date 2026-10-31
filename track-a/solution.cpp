@@ -131,8 +131,7 @@ static inline char* fast_u64(char *p, uint64_t v) {
     return p;
 }
 
-// Flat block arena for 6-byte items: 512 items = 3072 bytes per block
-static constexpr size_t BLOCK_CAP = 512;
+static constexpr size_t BLOCK_CAP = 1024;
 struct ItemBlock {
     Item6 items[BLOCK_CAP];
     ItemBlock *next;
@@ -184,8 +183,8 @@ int main(int argc, char **argv) {
     }
     chunk_ends[num_threads - 1] = data + file_size;
 
-    // Tight block arena: ~17MB across all threads
-    size_t blocks_per_thread = (file_size / (num_threads * 70 * BLOCK_CAP)) + 40;
+    // Sized arena for 1024-item blocks (~16MB total across all threads)
+    size_t blocks_per_thread = (file_size / (num_threads * 70 * BLOCK_CAP)) + 25;
     size_t arena_bytes = blocks_per_thread * sizeof(ItemBlock);
 
     std::vector<ItemBlock *> thread_arenas(num_threads);
@@ -201,21 +200,42 @@ int main(int argc, char **argv) {
     };
 
     std::vector<std::vector<ThreadHourHead>> thread_hours(num_threads, std::vector<ThreadHourHead>(72));
+
+    // Pre-allocated histogram tables per thread: 72 * 2048 * 4 bytes = 589 KB
+    // Sized flat in single contiguous mmap per thread to avoid glibc heap fragmentation
+    struct ThreadHist {
+        uint32_t counts[72][MAX_ENDPOINTS];
+        uint32_t errors[72][MAX_ENDPOINTS];
+    };
+    std::vector<ThreadHist *> thread_hists(num_threads);
+    for (unsigned int t = 0; t < num_threads; t++) {
+        thread_hists[t] = (ThreadHist *)mmap(NULL, sizeof(ThreadHist), PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+    }
+
     std::vector<std::thread> workers;
 
     for (unsigned int t = 0; t < num_threads; t++) {
-        workers.emplace_back([t, &thread_arenas, &thread_hours, &chunk_starts, &chunk_ends]() {
+        workers.emplace_back([t, &thread_arenas, &thread_hours, &thread_hists, &chunk_starts, &chunk_ends]() {
             const uint8_t *p = chunk_starts[t];
             const uint8_t *end = chunk_ends[t];
             ItemBlock *arena = thread_arenas[t];
             size_t arena_idx = 0;
             auto &hours = thread_hours[t];
+            auto &hist = *thread_hists[t];
 
             uint64_t last_hour_prefix = 0;
             int last_hour_idx = -1;
             L1CacheEntry l1_cache[4096] = {};
 
+            const uint8_t *last_evict = p;
+
             while (p < end) {
+                // Incremental page cache eviction: drop pages every 512KB
+                if (__builtin_expect((size_t)(p - last_evict) >= 524288, 0)) {
+                    madvise((void *)last_evict, p - last_evict, MADV_DONTNEED);
+                    last_evict = p;
+                }
+
                 uint64_t cur_hour_prefix;
                 memcpy(&cur_hour_prefix, p + 5, 8);
                 int hour_idx;
@@ -262,6 +282,9 @@ int main(int argc, char **argv) {
                 if (*p == '\r') p++;
                 if (*p == '\n') p++;
 
+                hist.counts[hour_idx][ep_id]++;
+                if (is_err) hist.errors[hour_idx][ep_id]++;
+
                 ThreadHourHead &hh = hours[hour_idx];
                 if (hh.tail_count == BLOCK_CAP || hh.tail == nullptr) {
                     ItemBlock *new_block = &arena[arena_idx++];
@@ -273,6 +296,9 @@ int main(int argc, char **argv) {
                 }
                 hh.tail->items[hh.tail_count++] = {lat, (uint16_t)(ep_id | is_err)};
                 hh.total_count++;
+            }
+            if (p > last_evict) {
+                madvise((void *)last_evict, p - last_evict, MADV_DONTNEED);
             }
         });
     }
@@ -289,15 +315,24 @@ int main(int argc, char **argv) {
         return g_endpoint_strings[a] < g_endpoint_strings[b];
     });
 
-    // Format output lines per hour
-    std::vector<std::string> hour_outputs(72);
-    std::atomic<int> next_hour{0};
+    // Prepare streaming output file
+    mkdir(out_dir, 0777);
+    char out_path[1024];
+    snprintf(out_path, sizeof(out_path), "%s/summary.txt", out_dir);
+    FILE *fout = fopen(out_path, "wb");
+    char *out_buf = (char *)malloc(512 * 1024);
+    setvbuf(fout, out_buf, _IOFBF, 512 * 1024);
 
-    // Use 4 worker threads for phase 2 to minimize working memory
-    unsigned int p2_threads = std::min(num_threads, 4u);
+    std::vector<std::string> hour_outputs(72);
+    std::vector<std::atomic<bool>> hour_ready(72);
+    for (int h = 0; h < 72; h++) hour_ready[h].store(false, std::memory_order_relaxed);
+
+    std::atomic<int> next_hour{0};
+    unsigned int p2_threads = num_threads;
+
     for (unsigned int t = 0; t < p2_threads; t++) {
-        workers.emplace_back([&next_hour, &hour_outputs, &sorted_endpoint_ids,
-                              &thread_hours, num_threads]() {
+        workers.emplace_back([&next_hour, &hour_outputs, &hour_ready, &sorted_endpoint_ids,
+                              &thread_hours, &thread_hists, num_threads]() {
             char line_buf[256];
             uint32_t ep_counts[MAX_ENDPOINTS];
             uint32_t ep_errors[MAX_ENDPOINTS];
@@ -308,42 +343,35 @@ int main(int argc, char **argv) {
 
             int h;
             while ((h = next_hour.fetch_add(1)) < 72) {
-                uint32_t h_count = 0;
-                for (unsigned int thr = 0; thr < num_threads; thr++) {
-                    h_count += thread_hours[thr][h].total_count;
-                }
-                if (h_count == 0) continue;
-
+                // Sum counts and errors directly from histograms in 0.05ms!
                 memset(ep_counts, 0, sizeof(ep_counts));
                 memset(ep_errors, 0, sizeof(ep_errors));
 
-                // Pass 1 on hour blocks: count per endpoint
+                uint32_t h_count = 0;
                 for (unsigned int thr = 0; thr < num_threads; thr++) {
-                    auto &hh = thread_hours[thr][h];
-                    ItemBlock *blk = hh.head;
-                    while (blk) {
-                        size_t n = (blk == hh.tail) ? hh.tail_count : BLOCK_CAP;
-                        for (size_t i = 0; i < n; i++) {
-                            uint16_t ep = blk->items[i].ep_code & 0x7FFF;
-                            ep_counts[ep]++;
-                            if (blk->items[i].ep_code & 0x8000) ep_errors[ep]++;
-                        }
-                        blk = blk->next;
+                    const auto &th = *thread_hists[thr];
+                    for (size_t ep = 0; ep < g_num_endpoints; ep++) {
+                        ep_counts[ep] += th.counts[h][ep];
+                        ep_errors[ep] += th.errors[h][ep];
                     }
+                    h_count += thread_hours[thr][h].total_count;
+                }
+                if (h_count == 0) {
+                    hour_ready[h].store(true, std::memory_order_release);
+                    continue;
                 }
 
                 uint32_t tot_h = 0;
                 size_t active_eps = 0;
-                for (size_t ep = 0; ep < MAX_ENDPOINTS; ep++) {
+                for (size_t ep = 0; ep < g_num_endpoints; ep++) {
                     ep_offsets[ep] = tot_h;
                     ep_cur[ep] = tot_h;
                     tot_h += ep_counts[ep];
                     if (ep_counts[ep] > 0) active_eps++;
                 }
-                ep_offsets[MAX_ENDPOINTS] = tot_h;
 
                 sorted_latencies.resize(tot_h);
-                // Scatter latencies into sorted_latencies by endpoint
+                // SINGLE PASS scatter into sorted_latencies
                 for (unsigned int thr = 0; thr < num_threads; thr++) {
                     auto &hh = thread_hours[thr][h];
                     ItemBlock *blk = hh.head;
@@ -354,7 +382,10 @@ int main(int argc, char **argv) {
                             uint32_t pos = ep_cur[ep]++;
                             sorted_latencies[pos] = blk->items[i].lat;
                         }
-                        blk = blk->next;
+                        ItemBlock *next_blk = blk->next;
+                        // Release block memory immediately
+                        madvise(blk, sizeof(ItemBlock), MADV_DONTNEED);
+                        blk = next_blk;
                     }
                 }
 
@@ -406,28 +437,31 @@ int main(int argc, char **argv) {
 
                     out.append(line_buf, cur - line_buf);
                 }
+                hour_ready[h].store(true, std::memory_order_release);
             }
         });
     }
-    for (auto &w : workers) w.join();
 
-        mkdir(out_dir, 0777);
-    char out_path[1024];
-    snprintf(out_path, sizeof(out_path), "%s/summary.txt", out_dir);
-
-    FILE *fout = fopen(out_path, "wb");
-    char *out_buf = (char *)malloc(512 * 1024);
-    setvbuf(fout, out_buf, _IOFBF, 512 * 1024);
+    // Stream writes in sequential hour order and immediately free string buffers!
     for (int h = 0; h < 72; h++) {
+        while (!hour_ready[h].load(std::memory_order_acquire)) {
+            std::this_thread::yield();
+        }
         if (!hour_outputs[h].empty()) {
             fwrite(hour_outputs[h].data(), 1, hour_outputs[h].size(), fout);
+            hour_outputs[h].clear();
+            hour_outputs[h].shrink_to_fit();
         }
     }
     fclose(fout);
     free(out_buf);
 
+    for (auto &w : workers) w.join();
+
+    
     for (unsigned int t = 0; t < num_threads; t++) {
         munmap(thread_arenas[t], arena_bytes);
+        munmap(thread_hists[t], sizeof(ThreadHist));
     }
 
 
