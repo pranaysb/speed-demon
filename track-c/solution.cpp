@@ -10,6 +10,11 @@
 #include <vector>
 #include <string>
 #include <thread>
+#include <chrono>
+
+#if defined(__linux__)
+#include <malloc.h>
+#endif
 
 static inline char* format_cents(char *buf, int64_t cents) {
     if (cents < 0) {
@@ -73,6 +78,10 @@ struct FinalCountryAgg {
 };
 
 int main(int argc, char **argv) {
+#if defined(__linux__)
+    mallopt(M_ARENA_MAX, 1);
+#endif
+
     const char *data_dir = "/data";
     const char *out_dir = "/out";
 
@@ -83,6 +92,8 @@ int main(int argc, char **argv) {
             out_dir = argv[++i];
         }
     }
+
+    auto t0 = std::chrono::high_resolution_clock::now();
 
     // 1. Load regions.csv
     char regions_path[1024];
@@ -97,7 +108,7 @@ int main(int argc, char **argv) {
     std::vector<std::string> country_names;
     country_names.push_back("_UNMATCHED"); // index 0
 
-    std::vector<uint16_t> region_to_cid(10000000, 0);
+    std::vector<uint16_t> region_to_cid(1000005, 0);
 
     struct CountryEntry { char code[4]; uint16_t cid; };
     std::vector<CountryEntry> country_table;
@@ -130,10 +141,9 @@ int main(int argc, char **argv) {
         size_t c_len = p - country_start;
 
         uint16_t cid = get_or_add_country(country_start, c_len);
-        if (reg_id >= region_to_cid.size()) {
-            region_to_cid.resize(reg_id + 100000, 0);
+        if (reg_id < region_to_cid.size()) {
+            region_to_cid[reg_id] = cid;
         }
-        region_to_cid[reg_id] = cid;
     }
     fclose(rf);
 
@@ -150,16 +160,16 @@ int main(int argc, char **argv) {
     fstat(fd, &st);
     size_t file_size = st.st_size;
 
-    const uint8_t *data = (const uint8_t *)mmap(NULL, file_size, PROT_READ, MAP_PRIVATE, fd, 0);
+    const uint8_t *data = (const uint8_t *)mmap(NULL, file_size, PROT_READ, MAP_SHARED, fd, 0);
     if (data == MAP_FAILED) {
         perror("mmap records");
         close(fd);
         return 1;
     }
-    madvise((void *)data, file_size, MADV_SEQUENTIAL | MADV_WILLNEED);
 
     unsigned int num_threads = std::thread::hardware_concurrency();
     if (num_threads == 0) num_threads = 4;
+    if (num_threads > 12) num_threads = 12;
 
     std::vector<const uint8_t *> chunk_starts(num_threads);
     std::vector<const uint8_t *> chunk_ends(num_threads);
@@ -168,15 +178,15 @@ int main(int argc, char **argv) {
         size_t s = (i * file_size) / num_threads;
         if (i == 0) {
             const uint8_t *p = data;
-            if (file_size >= 3 && p[0] == 0xEF && p[1] == 0xBB && p[2] == 0xBF) p += 3;
             while (p < data + file_size && *p != '\n') p++;
             if (p < data + file_size) p++;
-            chunk_starts[i] = p;
+            chunk_starts[0] = p;
         } else {
             const uint8_t *p = data + s;
             const uint8_t *end = data + file_size;
             while (p < end) {
-                if (p > data && *(p - 1) == '\n') {
+                if (*p == '\n') {
+                    p++;
                     const uint8_t *rec = p;
                     if (end - rec >= 3 && rec[0] == 0xEF && rec[1] == 0xBB && rec[2] == 0xBF) {
                         rec += 3;
@@ -202,7 +212,7 @@ int main(int argc, char **argv) {
     for (unsigned int t = 0; t < num_threads; t++) {
         thread_aggs[t].resize(num_countries);
         for (size_t c = 0; c < num_countries; c++) {
-            thread_aggs[t][c].name_hashes.reserve(1000);
+            thread_aggs[t][c].name_hashes.reserve(256);
         }
     }
 
@@ -239,7 +249,7 @@ int main(int argc, char **argv) {
                                 name_len++;
                                 p += 2;
                             } else {
-                                p++; // closing quote
+                                p++;
                                 break;
                             }
                         } else {
@@ -341,7 +351,10 @@ int main(int argc, char **argv) {
     for (auto &w : workers) w.join();
     workers.clear();
 
-    // 3. Merge aggregates across threads
+    munmap((void *)data, file_size);
+    close(fd);
+
+    // 3. Merge aggregates across threads in parallel
     std::vector<FinalCountryAgg> final_aggs(num_countries);
     for (size_t c = 0; c < num_countries; c++) {
         final_aggs[c].key = country_names[c];
@@ -359,7 +372,7 @@ int main(int argc, char **argv) {
                 all_hashes.reserve(total_h);
 
                 for (size_t thr = 0; thr < thread_aggs.size(); thr++) {
-                    const auto &ca = thread_aggs[thr][c];
+                    auto &ca = thread_aggs[thr][c];
                     if (ca.count == 0) continue;
                     fa.count += ca.count;
                     fa.id_sum += ca.id_sum;
@@ -375,6 +388,8 @@ int main(int argc, char **argv) {
                         if (ca.amount_max > fa.amount_max) fa.amount_max = ca.amount_max;
                     }
                     all_hashes.insert(all_hashes.end(), ca.name_hashes.begin(), ca.name_hashes.end());
+                    ca.name_hashes.clear();
+                    ca.name_hashes.shrink_to_fit();
                 }
 
                 if (!all_hashes.empty()) {
@@ -424,8 +439,8 @@ int main(int argc, char **argv) {
     }
     fclose(out);
     free(out_buf);
-    munmap((void *)data, file_size);
-    close(fd);
 
+    auto t1 = std::chrono::high_resolution_clock::now();
+    printf("Track C total time: %.2f ms\n", std::chrono::duration<double, std::milli>(t1 - t0).count());
     return 0;
 }

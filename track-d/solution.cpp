@@ -9,6 +9,11 @@
 #include <algorithm>
 #include <vector>
 #include <thread>
+#include <chrono>
+
+#if defined(__linux__)
+#include <malloc.h>
+#endif
 
 struct Edge {
     uint32_t target;
@@ -25,12 +30,12 @@ public:
     std::vector<HeapItem> data;
     size_t sz = 0;
 
-    QuadHeap() { data.resize(131072); }
+    QuadHeap() { data.resize(65536); }
     inline bool empty() const { return sz == 0; }
     inline void clear() { sz = 0; }
 
     inline void push(uint64_t dist, uint32_t u) {
-        if (sz >= data.size()) data.resize(data.size() * 2);
+        if (__builtin_expect(sz >= data.size(), 0)) data.resize(data.size() * 2);
         size_t idx = sz++;
         data[idx] = {dist, u};
         while (idx > 0) {
@@ -97,16 +102,19 @@ static inline char* fast_i64(char *p, int64_t v) {
 }
 
 int main(int argc, char **argv) {
+#if defined(__linux__)
+    mallopt(M_ARENA_MAX, 1);
+#endif
+
     const char *data_dir = "/data";
     const char *out_dir = "/out";
 
     for (int i = 1; i < argc; i++) {
-        if (strcmp(argv[i], "--data") == 0 && i + 1 < argc) {
-            data_dir = argv[++i];
-        } else if (strcmp(argv[i], "--out") == 0 && i + 1 < argc) {
-            out_dir = argv[++i];
-        }
+        if (strcmp(argv[i], "--data") == 0 && i + 1 < argc) data_dir = argv[++i];
+        else if (strcmp(argv[i], "--out") == 0 && i + 1 < argc) out_dir = argv[++i];
     }
+
+    auto t0 = std::chrono::high_resolution_clock::now();
 
     char graph_path[1024];
     snprintf(graph_path, sizeof(graph_path), "%s/graph.txt", data_dir);
@@ -117,9 +125,8 @@ int main(int argc, char **argv) {
     struct stat st;
     fstat(g_fd, &st);
     size_t g_size = st.st_size;
-    const uint8_t *g_data = (const uint8_t *)mmap(NULL, g_size, PROT_READ, MAP_PRIVATE, g_fd, 0);
+    const uint8_t *g_data = (const uint8_t *)mmap(NULL, g_size, PROT_READ, MAP_SHARED, g_fd, 0);
     if (g_data == MAP_FAILED) { perror("mmap graph"); close(g_fd); return 1; }
-    madvise((void *)g_data, g_size, MADV_SEQUENTIAL | MADV_WILLNEED);
 
     const uint8_t *p = g_data;
     uint32_t num_nodes = 0, num_edges = 0;
@@ -166,7 +173,7 @@ int main(int argc, char **argv) {
 
     fstat(q_fd, &st);
     size_t q_size = st.st_size;
-    const uint8_t *q_data = (const uint8_t *)mmap(NULL, q_size, PROT_READ, MAP_PRIVATE, q_fd, 0);
+    const uint8_t *q_data = (const uint8_t *)mmap(NULL, q_size, PROT_READ, MAP_SHARED, q_fd, 0);
 
     struct Query { uint32_t s; uint32_t t; };
     std::vector<Query> queries;
@@ -187,7 +194,10 @@ int main(int argc, char **argv) {
     size_t num_queries = queries.size();
     std::vector<int64_t> answers(num_queries, -1);
 
-    unsigned int num_threads = 6; // Pin to 6 physical execution threads to minimize L3 cache pressure
+    unsigned int num_threads = std::thread::hardware_concurrency();
+    if (num_threads == 0) num_threads = 4;
+    if (num_threads > 12) num_threads = 12;
+
     std::vector<std::thread> workers;
     size_t chunk_size = (num_queries + num_threads - 1) / num_threads;
 
@@ -260,5 +270,7 @@ int main(int argc, char **argv) {
     fclose(out);
     free(out_buf);
 
+    auto t1 = std::chrono::high_resolution_clock::now();
+    printf("Track D total time: %.2f ms\n", std::chrono::duration<double, std::milli>(t1 - t0).count());
     return 0;
 }
