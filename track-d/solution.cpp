@@ -232,6 +232,8 @@ int main(int argc, char **argv) {
         f_offsets[i] = f_tot;
         b_offsets[i] = b_tot;
     }
+    std::vector<std::atomic<uint32_t>>().swap(f_offsets_atomic);
+    std::vector<std::atomic<uint32_t>>().swap(b_offsets_atomic);
 
     // Atomic cursors for parallel edge writing
     std::vector<std::atomic<uint32_t>> f_cur(num_nodes);
@@ -264,6 +266,11 @@ int main(int argc, char **argv) {
     }
     for (auto &w : workers) w.join();
     workers.clear();
+    std::vector<std::atomic<uint32_t>>().swap(f_cur);
+    std::vector<std::atomic<uint32_t>>().swap(b_cur);
+#if defined(__linux__)
+    malloc_trim(0);
+#endif
 
     madvise((void *)g_data, g_size, MADV_DONTNEED);
     munmap((void *)g_data, g_size);
