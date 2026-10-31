@@ -163,8 +163,8 @@ static inline uint32_t get_or_insert_name_id(uint64_t h) {
     }
 }
 
-// Country bitset: 262,144 bits = 4096 uint64_t words per country
-static constexpr size_t BITSET_WORDS = 4096;
+// Country bitset: 131,072 bits = 2048 uint64_t words per country (covers 100,520 distinct names)
+static constexpr size_t BITSET_WORDS = 2048;
 static std::atomic<uint64_t> g_country_bitsets[256][BITSET_WORDS];
 
 int main(int argc, char **argv) {
@@ -306,7 +306,7 @@ int main(int argc, char **argv) {
             auto &aggs = thread_aggs[t];
             size_t reg_limit = region_to_cid.size();
             struct L1NameEntry { uint64_t hash; uint32_t nid; };
-            L1NameEntry l1_names[2048] = {};
+            std::vector<L1NameEntry> l1_names(32768, {0, 0});
 
             while (p < end) {
                 if (end - p >= 3 && p[0] == 0xEF && p[1] == 0xBB && p[2] == 0xBF) p += 3;
@@ -447,7 +447,7 @@ int main(int argc, char **argv) {
                 ca.note_bytes += note_len;
 
                 // Lookup dense name ID and set in country bitset
-                uint32_t l1_idx = n_hash & 2047;
+                uint32_t l1_idx = n_hash & 32767;
                 uint32_t nid;
                 if (l1_names[l1_idx].hash == n_hash && l1_names[l1_idx].nid != 0) {
                     nid = l1_names[l1_idx].nid;

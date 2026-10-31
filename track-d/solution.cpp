@@ -272,31 +272,9 @@ int main(int argc, char **argv) {
     munmap((void *)g_data, g_size);
     close(g_fd);
 
-    // Connected components for O(1) reachability check
-    std::vector<uint32_t> comp(num_nodes, 0);
-    uint32_t current_comp = 0;
-    std::vector<uint32_t> q(num_nodes);
-
-    for (uint32_t i = 0; i < num_nodes; i++) {
-        if (comp[i] != 0) continue;
-        current_comp++;
-        size_t head = 0, tail = 0;
-        comp[i] = current_comp;
-        q[tail++] = i;
-
-        while (head < tail) {
-            uint32_t u = q[head++];
-            for (uint32_t e = f_offsets[u], ee = f_offsets[u + 1]; e < ee; e++) {
-                uint32_t v = f_edges[e].target;
-                if (comp[v] == 0) { comp[v] = current_comp; q[tail++] = v; }
-            }
-            for (uint32_t e = b_offsets[u], ee = b_offsets[u + 1]; e < ee; e++) {
-                uint32_t v = b_edges[e].target;
-                if (comp[v] == 0) { comp[v] = current_comp; q[tail++] = v; }
-            }
-        }
-    }
-    std::vector<uint32_t>().swap(q);
+#if defined(__linux__)
+    malloc_trim(0);
+#endif
 
     // Read queries
     char queries_path[1024];
@@ -327,8 +305,9 @@ int main(int argc, char **argv) {
 
     // Dynamic work-stealing queue!
     std::atomic<size_t> next_qid{0};
+    unsigned int query_threads = std::min(num_threads, 8u);
 
-    for (unsigned int tid = 0; tid < num_threads; tid++) {
+    for (unsigned int tid = 0; tid < query_threads; tid++) {
         workers.emplace_back([&]() {
             DistMap map_f, map_b;
             QuadHeap pq_f, pq_b;
@@ -343,7 +322,7 @@ int main(int argc, char **argv) {
                     if (s >= num_nodes || t >= num_nodes) { answers[qid] = -1; continue; }
                     if (s == t) { answers[qid] = 0; continue; }
 
-                    if (f_offsets[s + 1] == f_offsets[s] || b_offsets[t + 1] == b_offsets[t] || comp[s] != comp[t]) {
+                    if (f_offsets[s + 1] == f_offsets[s] || b_offsets[t + 1] == b_offsets[t]) {
                         answers[qid] = -1;
                         continue;
                     }
@@ -356,7 +335,7 @@ int main(int argc, char **argv) {
                     while (!pq_f.empty() && !pq_b.empty()) {
                         if (pq_f.top_dist() + pq_b.top_dist() >= best_dist) break;
 
-                        if (pq_f.top_dist() <= pq_b.top_dist()) {
+                        if (pq_f.sz <= pq_b.sz) {
                             HeapItem item = pq_f.pop();
                             uint64_t d = item.dist;
                             uint32_t u = item.u;
