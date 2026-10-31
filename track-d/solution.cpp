@@ -9,7 +9,6 @@
 #include <algorithm>
 #include <vector>
 #include <thread>
-#include <chrono>
 
 #if defined(__linux__)
 #include <malloc.h>
@@ -110,11 +109,12 @@ int main(int argc, char **argv) {
     const char *out_dir = "/out";
 
     for (int i = 1; i < argc; i++) {
-        if (strcmp(argv[i], "--data") == 0 && i + 1 < argc) data_dir = argv[++i];
-        else if (strcmp(argv[i], "--out") == 0 && i + 1 < argc) out_dir = argv[++i];
+        if (strcmp(argv[i], "--data") == 0 && i + 1 < argc) {
+            data_dir = argv[++i];
+        } else if (strcmp(argv[i], "--out") == 0 && i + 1 < argc) {
+            out_dir = argv[++i];
+        }
     }
-
-    auto t0 = std::chrono::high_resolution_clock::now();
 
     char graph_path[1024];
     snprintf(graph_path, sizeof(graph_path), "%s/graph.txt", data_dir);
@@ -127,6 +127,7 @@ int main(int argc, char **argv) {
     size_t g_size = st.st_size;
     const uint8_t *g_data = (const uint8_t *)mmap(NULL, g_size, PROT_READ, MAP_SHARED, g_fd, 0);
     if (g_data == MAP_FAILED) { perror("mmap graph"); close(g_fd); return 1; }
+    madvise((void *)g_data, g_size, MADV_SEQUENTIAL | MADV_WILLNEED);
 
     const uint8_t *p = g_data;
     uint32_t num_nodes = 0, num_edges = 0;
@@ -194,10 +195,8 @@ int main(int argc, char **argv) {
     size_t num_queries = queries.size();
     std::vector<int64_t> answers(num_queries, -1);
 
-    unsigned int num_threads = std::thread::hardware_concurrency();
-    if (num_threads == 0) num_threads = 4;
-    if (num_threads > 12) num_threads = 12;
-
+    // Pin execution to 6 worker threads to avoid L3 cache thrashing and CFS CPU quota throttling
+    unsigned int num_threads = 6;
     std::vector<std::thread> workers;
     size_t chunk_size = (num_queries + num_threads - 1) / num_threads;
 
@@ -221,7 +220,6 @@ int main(int argc, char **argv) {
                 dist[s] = 0;
                 touched.push_back(s);
                 pq.push(0, s);
-                int64_t found_dist = -1;
 
                 while (!pq.empty()) {
                     HeapItem top = pq.pop();
@@ -229,12 +227,19 @@ int main(int argc, char **argv) {
                     uint32_t u = top.u;
 
                     if (d > dist[u]) continue;
-                    if (u == t) { found_dist = (int64_t)d; break; }
+                    if (u == t) break;
+
+                    // Target-bounded prune: no path through remaining queue items can beat dist[t]
+                    if (dist[t] != UINT64_MAX && d >= dist[t]) break;
 
                     uint32_t es = offsets[u], ee = offsets[u + 1];
                     for (uint32_t e = es; e < ee; e++) {
                         uint32_t v = edges[e].target;
                         uint64_t nd = d + edges[e].weight;
+
+                        // Never push or relax edges that cannot improve upon current dist[t]
+                        if (dist[t] != UINT64_MAX && nd >= dist[t]) continue;
+
                         if (nd < dist[v]) {
                             if (dist[v] == UINT64_MAX) touched.push_back(v);
                             dist[v] = nd;
@@ -243,7 +248,7 @@ int main(int argc, char **argv) {
                     }
                 }
 
-                answers[qid] = found_dist;
+                answers[qid] = (dist[t] == UINT64_MAX) ? -1 : (int64_t)dist[t];
                 for (uint32_t x : touched) dist[x] = UINT64_MAX;
                 touched.clear();
                 pq.clear();
@@ -270,7 +275,5 @@ int main(int argc, char **argv) {
     fclose(out);
     free(out_buf);
 
-    auto t1 = std::chrono::high_resolution_clock::now();
-    printf("Track D total time: %.2f ms\n", std::chrono::duration<double, std::milli>(t1 - t0).count());
     return 0;
 }
