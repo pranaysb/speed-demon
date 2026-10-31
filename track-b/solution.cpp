@@ -538,10 +538,14 @@ int main(int argc, char **argv) {
             thread_write_ptrs[tid][t] += base;
         }
     }
-    thread_counts.clear();
+    std::vector<std::vector<uint32_t>>().swap(thread_counts);
+#if defined(__linux__)
+    malloc_trim(0);
+#endif
 
-    // Allocate flat postings array
-    uint32_t *all_postings = (uint32_t *)malloc(total_postings * sizeof(uint32_t));
+    // Allocate flat postings array via direct mmap
+    size_t postings_bytes = (size_t)total_postings * sizeof(uint32_t);
+    uint32_t *all_postings = (uint32_t *)mmap(NULL, postings_bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
 
     
     // Pass 2: Write doc_ids into contiguous slices
@@ -600,7 +604,10 @@ int main(int argc, char **argv) {
     }
     for (auto &w : workers) w.join();
     workers.clear();
-    thread_write_ptrs.clear();
+    std::vector<std::vector<uint32_t>>().swap(thread_write_ptrs);
+#if defined(__linux__)
+    malloc_trim(0);
+#endif
     madvise((void *)d_data, d_size, MADV_DONTNEED);
 
     
@@ -621,8 +628,9 @@ int main(int argc, char **argv) {
             out_vec.resize((end_q - start_q) * 96);
             char *out_ptr = out_vec.data();
 
-            uint32_t *buf_a = (uint32_t *)malloc(MAX_DOCS * sizeof(uint32_t));
-            uint32_t *buf_b = (uint32_t *)malloc(MAX_DOCS * sizeof(uint32_t));
+            size_t buf_bytes = MAX_DOCS * sizeof(uint32_t);
+            uint32_t *buf_a = (uint32_t *)mmap(NULL, buf_bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+            uint32_t *buf_b = (uint32_t *)mmap(NULL, buf_bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
             std::vector<uint32_t> matches;
             matches.reserve(1024);
 
@@ -747,8 +755,8 @@ int main(int argc, char **argv) {
                 }
             }
             out_vec.resize(out_ptr - out_vec.data());
-            free(buf_a);
-            free(buf_b);
+            munmap(buf_a, buf_bytes);
+            munmap(buf_b, buf_bytes);
         });
     }
     for (auto &w : workers) w.join();
@@ -770,7 +778,7 @@ int main(int argc, char **argv) {
     }
     fclose(out);
     free(out_buf);
-    free(all_postings);
+    munmap(all_postings, postings_bytes);
     munmap((void *)d_data, d_size);
     close(d_fd);
 

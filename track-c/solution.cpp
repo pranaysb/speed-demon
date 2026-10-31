@@ -207,31 +207,28 @@ int main(int argc, char **argv) {
     chunk_ends[num_threads - 1] = data + file_size;
 
     std::vector<std::vector<ThreadCountryAgg>> thread_aggs(num_threads, std::vector<ThreadCountryAgg>(num_countries));
-    std::vector<uint64_t *> thread_raw_hashes(num_threads);
-    std::vector<uint64_t *> thread_sorted_hashes(num_threads);
+    std::vector<uint64_t *> thread_hashes(num_threads);
     std::vector<size_t> thread_hash_bytes(num_threads);
     std::vector<size_t> thread_recs(num_threads);
-    std::vector<std::vector<uint32_t>> thread_c_counts(num_threads, std::vector<uint32_t>(num_countries, 0));
     std::vector<std::vector<uint32_t>> thread_c_offsets(num_threads, std::vector<uint32_t>(num_countries + 1, 0));
 
     for (unsigned int t = 0; t < num_threads; t++) {
         size_t chunk_bytes = chunk_ends[t] - chunk_starts[t];
-        size_t max_recs = (chunk_bytes / 30) + 10000;
+        size_t max_recs = (chunk_bytes / 45) + 10000;
         thread_hash_bytes[t] = max_recs * sizeof(uint64_t);
-        thread_raw_hashes[t] = (uint64_t *)mmap(NULL, thread_hash_bytes[t], PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+        thread_hashes[t] = (uint64_t *)mmap(NULL, thread_hash_bytes[t], PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
     }
 
     std::vector<std::thread> workers;
 
     for (unsigned int t = 0; t < num_threads; t++) {
-        workers.emplace_back([t, &thread_aggs, &thread_raw_hashes, &thread_sorted_hashes,
-                              &thread_hash_bytes, &thread_recs, &thread_c_counts, &thread_c_offsets,
+        workers.emplace_back([t, &thread_aggs, &thread_hashes,
+                              &thread_recs, &thread_c_offsets,
                               &chunk_starts, &chunk_ends, &region_to_cid, num_countries]() {
             const uint8_t *p = chunk_starts[t];
             const uint8_t *end = chunk_ends[t];
             auto &aggs = thread_aggs[t];
-            auto &counts = thread_c_counts[t];
-            uint64_t *hptr = thread_raw_hashes[t];
+            uint64_t *hptr = thread_hashes[t];
             size_t reg_limit = region_to_cid.size();
 
             while (p < end) {
@@ -370,31 +367,23 @@ int main(int argc, char **argv) {
                 ca.name_bytes += name_len;
                 ca.note_bytes += note_len;
 
-                counts[cid]++;
                 *hptr++ = ((uint64_t)cid << 56) | (n_hash & 0x00FFFFFFFFFFFFFFULL);
             }
-            size_t n = hptr - thread_raw_hashes[t];
+            size_t n = hptr - thread_hashes[t];
             thread_recs[t] = n;
 
-            // Local counting sort by cid
-            uint64_t *sorted_part = (uint64_t *)mmap(NULL, thread_hash_bytes[t], PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
-            thread_sorted_hashes[t] = sorted_part;
+            // In-place sort of 64-bit combined values
+            uint64_t *base = thread_hashes[t];
+            std::sort(base, base + n);
 
+            // Compute country offsets in-place
             auto &offsets = thread_c_offsets[t];
+            size_t cur_idx = 0;
             for (size_t c = 0; c < num_countries; c++) {
-                offsets[c + 1] = offsets[c] + counts[c];
+                while (cur_idx < n && (base[cur_idx] >> 56) < c) cur_idx++;
+                offsets[c] = (uint32_t)cur_idx;
             }
-            std::vector<uint32_t> cur = offsets;
-
-            const uint64_t *src = thread_raw_hashes[t];
-            for (size_t i = 0; i < n; i++) {
-                uint8_t cid = src[i] >> 56;
-                uint32_t pos = cur[cid]++;
-                sorted_part[pos] = src[i] & 0x00FFFFFFFFFFFFFFULL;
-            }
-
-            munmap(thread_raw_hashes[t], thread_hash_bytes[t]);
-            thread_raw_hashes[t] = nullptr;
+            offsets[num_countries] = (uint32_t)n;
         });
     }
     for (auto &w : workers) w.join();
@@ -413,7 +402,7 @@ int main(int argc, char **argv) {
 
     for (unsigned int t = 0; t < num_threads; t++) {
         workers.emplace_back([&next_country, num_countries, num_threads, &final_aggs, &thread_aggs,
-                              &thread_sorted_hashes, &thread_c_counts, &thread_c_offsets]() {
+                              &thread_hashes, &thread_c_offsets]() {
             std::vector<uint64_t> country_hashes;
             country_hashes.reserve(131072);
 
@@ -438,11 +427,11 @@ int main(int argc, char **argv) {
                     fa.name_bytes += ca.name_bytes;
                     fa.note_bytes += ca.note_bytes;
 
-                    uint32_t cnt = thread_c_counts[thr][c];
-                    if (cnt > 0) {
-                        uint32_t off = thread_c_offsets[thr][c];
-                        const uint64_t *p = &thread_sorted_hashes[thr][off];
-                        country_hashes.insert(country_hashes.end(), p, p + cnt);
+                    uint32_t start_off = thread_c_offsets[thr][c];
+                    uint32_t end_off = thread_c_offsets[thr][c + 1];
+                    if (end_off > start_off) {
+                        const uint64_t *p = &thread_hashes[thr][start_off];
+                        country_hashes.insert(country_hashes.end(), p, p + (end_off - start_off));
                     }
                 }
 
@@ -457,7 +446,7 @@ int main(int argc, char **argv) {
     workers.clear();
 
     for (unsigned int t = 0; t < num_threads; t++) {
-        munmap(thread_sorted_hashes[t], thread_hash_bytes[t]);
+        munmap(thread_hashes[t], thread_hash_bytes[t]);
     }
 
     // Sort final output by country code
