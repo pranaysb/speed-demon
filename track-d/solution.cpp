@@ -148,7 +148,6 @@ int main(int argc, char **argv) {
 #if defined(__linux__)
     mallopt(M_ARENA_MAX, 1);
 #endif
-    auto t_start = std::chrono::high_resolution_clock::now();
 
     const char *data_dir = "/data";
     const char *out_dir = "/out";
@@ -168,7 +167,6 @@ int main(int argc, char **argv) {
     fstat(g_fd, &st);
     size_t g_size = st.st_size;
     const uint8_t *g_data = (const uint8_t *)mmap(NULL, g_size, PROT_READ, MAP_SHARED, g_fd, 0);
-    madvise((void *)g_data, g_size, MADV_SEQUENTIAL);
 
     const uint8_t *p = g_data;
     uint32_t num_nodes = 0, num_edges = 0;
@@ -183,6 +181,7 @@ int main(int argc, char **argv) {
 
     unsigned int num_threads = std::thread::hardware_concurrency();
     if (num_threads == 0) num_threads = 4;
+    if (num_threads > 12) num_threads = 12;
 
     std::vector<const uint8_t *> chunk_starts(num_threads);
     std::vector<const uint8_t *> chunk_ends(num_threads);
@@ -235,7 +234,6 @@ int main(int argc, char **argv) {
     std::vector<std::atomic<uint32_t>>().swap(f_offsets_atomic);
     std::vector<std::atomic<uint32_t>>().swap(b_offsets_atomic);
 
-    // Atomic cursors for parallel edge writing
     std::vector<std::atomic<uint32_t>> f_cur(num_nodes);
     std::vector<std::atomic<uint32_t>> b_cur(num_nodes);
     for (uint32_t i = 0; i < num_nodes; i++) {
@@ -258,38 +256,33 @@ int main(int argc, char **argv) {
                 if (cur < cend && *cur == '\r') cur++;
                 if (cur < cend && *cur == '\n') cur++;
                 uint32_t pos_f = f_cur[u].fetch_add(1, std::memory_order_relaxed);
-                uint32_t pos_b = b_cur[v].fetch_add(1, std::memory_order_relaxed);
                 f_edges[pos_f] = {v, w};
+                uint32_t pos_b = b_cur[v].fetch_add(1, std::memory_order_relaxed);
                 b_edges[pos_b] = {u, w};
             }
         });
     }
     for (auto &w : workers) w.join();
     workers.clear();
+
     std::vector<std::atomic<uint32_t>>().swap(f_cur);
     std::vector<std::atomic<uint32_t>>().swap(b_cur);
-#if defined(__linux__)
-    malloc_trim(0);
-#endif
 
-    madvise((void *)g_data, g_size, MADV_DONTNEED);
+    // Unmap graph.txt immediately
     munmap((void *)g_data, g_size);
-#if defined(__linux__)
-    posix_fadvise(g_fd, 0, 0, POSIX_FADV_DONTNEED);
-#endif
     close(g_fd);
 
-    // Fast BFS component labeling
-    std::vector<uint8_t> comp(num_nodes, 0);
+    // Connected components for O(1) reachability check
+    std::vector<uint32_t> comp(num_nodes, 0);
+    uint32_t current_comp = 0;
     std::vector<uint32_t> q(num_nodes);
-    uint8_t current_comp = 0;
 
-    for (uint32_t root = 0; root < num_nodes; root++) {
-        if (comp[root] != 0) continue;
+    for (uint32_t i = 0; i < num_nodes; i++) {
+        if (comp[i] != 0) continue;
         current_comp++;
         size_t head = 0, tail = 0;
-        comp[root] = current_comp;
-        q[tail++] = root;
+        comp[i] = current_comp;
+        q[tail++] = i;
 
         while (head < tail) {
             uint32_t u = q[head++];
@@ -303,7 +296,7 @@ int main(int argc, char **argv) {
             }
         }
     }
-    q.clear(); q.shrink_to_fit();
+    std::vector<uint32_t>().swap(q);
 
     // Read queries
     char queries_path[1024];
@@ -326,98 +319,94 @@ int main(int argc, char **argv) {
         if (p < q_end && *p == '\n') p++;
         queries.push_back(q_item);
     }
-    madvise((void *)q_data, q_size, MADV_DONTNEED);
     munmap((void *)q_data, q_size);
-#if defined(__linux__)
-    posix_fadvise(q_fd, 0, 0, POSIX_FADV_DONTNEED);
-#endif
     close(q_fd);
 
     size_t num_queries = queries.size();
     std::vector<int64_t> answers(num_queries, -1);
 
-    unsigned int q_threads = std::min(12u, std::max(4u, std::thread::hardware_concurrency()));
-    size_t chunk_size = (num_queries + q_threads - 1) / q_threads;
+    // Dynamic work-stealing queue!
+    std::atomic<size_t> next_qid{0};
 
-    for (unsigned int tid = 0; tid < q_threads; tid++) {
-        size_t start_q = tid * chunk_size;
-        size_t end_q = std::min(start_q + chunk_size, num_queries);
-        if (start_q >= end_q) continue;
-
-        workers.emplace_back([&, start_q, end_q]() {
+    for (unsigned int tid = 0; tid < num_threads; tid++) {
+        workers.emplace_back([&]() {
             DistMap map_f, map_b;
             QuadHeap pq_f, pq_b;
 
-            for (size_t qid = start_q; qid < end_q; qid++) {
-                uint32_t s = queries[qid].s;
-                uint32_t t = queries[qid].t;
-                if (s >= num_nodes || t >= num_nodes) { answers[qid] = -1; continue; }
-                if (s == t) { answers[qid] = 0; continue; }
+            size_t batch_start;
+            while ((batch_start = next_qid.fetch_add(16, std::memory_order_relaxed)) < num_queries) {
+                size_t batch_end = std::min(batch_start + 16, num_queries);
 
-                // O(1) unreachable pruning
-                if (f_offsets[s + 1] == f_offsets[s] || b_offsets[t + 1] == b_offsets[t] || comp[s] != comp[t]) {
-                    answers[qid] = -1;
-                    continue;
-                }
+                for (size_t qid = batch_start; qid < batch_end; qid++) {
+                    uint32_t s = queries[qid].s;
+                    uint32_t t = queries[qid].t;
+                    if (s >= num_nodes || t >= num_nodes) { answers[qid] = -1; continue; }
+                    if (s == t) { answers[qid] = 0; continue; }
 
-                map_f.update(s, 0); pq_f.push(0, s);
-                map_b.update(t, 0); pq_b.push(0, t);
+                    if (f_offsets[s + 1] == f_offsets[s] || b_offsets[t + 1] == b_offsets[t] || comp[s] != comp[t]) {
+                        answers[qid] = -1;
+                        continue;
+                    }
 
-                uint64_t best_dist = UINT64_MAX;
+                    map_f.update(s, 0); pq_f.push(0, s);
+                    map_b.update(t, 0); pq_b.push(0, t);
 
-                while (!pq_f.empty() && !pq_b.empty()) {
-                    if (pq_f.top_dist() + pq_b.top_dist() >= best_dist) break;
+                    uint64_t best_dist = UINT64_MAX;
 
-                    if (pq_f.top_dist() <= pq_b.top_dist()) {
-                        HeapItem item = pq_f.pop();
-                        uint64_t d = item.dist;
-                        uint32_t u = item.u;
-                        if (d > map_f.get(u)) continue;
+                    while (!pq_f.empty() && !pq_b.empty()) {
+                        if (pq_f.top_dist() + pq_b.top_dist() >= best_dist) break;
 
-                        uint32_t es = f_offsets[u], ee = f_offsets[u + 1];
-                        for (uint32_t e = es; e < ee; e++) {
-                            uint32_t v = f_edges[e].target;
-                            uint64_t nd = d + f_edges[e].weight;
-                            if (nd >= best_dist) continue;
+                        if (pq_f.top_dist() <= pq_b.top_dist()) {
+                            HeapItem item = pq_f.pop();
+                            uint64_t d = item.dist;
+                            uint32_t u = item.u;
+                            if (d > map_f.get(u)) continue;
 
-                            if (map_f.update(v, nd)) {
-                                pq_f.push(nd, v);
-                                uint64_t bd = map_b.get(v);
-                                if (bd != UINT64_MAX) {
-                                    uint64_t cand = nd + bd;
-                                    if (cand < best_dist) best_dist = cand;
+                            uint32_t es = f_offsets[u], ee = f_offsets[u + 1];
+                            for (uint32_t e = es; e < ee; e++) {
+                                uint32_t v = f_edges[e].target;
+                                uint64_t nd = d + f_edges[e].weight;
+                                if (nd >= best_dist) continue;
+
+                                if (map_f.update(v, nd)) {
+                                    pq_f.push(nd, v);
+                                    uint64_t bd = map_b.get(v);
+                                    if (bd != UINT64_MAX) {
+                                        uint64_t cand = nd + bd;
+                                        if (cand < best_dist) best_dist = cand;
+                                    }
                                 }
                             }
-                        }
-                    } else {
-                        HeapItem item = pq_b.pop();
-                        uint64_t d = item.dist;
-                        uint32_t u = item.u;
-                        if (d > map_b.get(u)) continue;
+                        } else {
+                            HeapItem item = pq_b.pop();
+                            uint64_t d = item.dist;
+                            uint32_t u = item.u;
+                            if (d > map_b.get(u)) continue;
 
-                        uint32_t es = b_offsets[u], ee = b_offsets[u + 1];
-                        for (uint32_t e = es; e < ee; e++) {
-                            uint32_t v = b_edges[e].target;
-                            uint64_t nd = d + b_edges[e].weight;
-                            if (nd >= best_dist) continue;
+                            uint32_t es = b_offsets[u], ee = b_offsets[u + 1];
+                            for (uint32_t e = es; e < ee; e++) {
+                                uint32_t v = b_edges[e].target;
+                                uint64_t nd = d + b_edges[e].weight;
+                                if (nd >= best_dist) continue;
 
-                            if (map_b.update(v, nd)) {
-                                pq_b.push(nd, v);
-                                uint64_t fd = map_f.get(v);
-                                if (fd != UINT64_MAX) {
-                                    uint64_t cand = nd + fd;
-                                    if (cand < best_dist) best_dist = cand;
+                                if (map_b.update(v, nd)) {
+                                    pq_b.push(nd, v);
+                                    uint64_t fd = map_f.get(v);
+                                    if (fd != UINT64_MAX) {
+                                        uint64_t cand = nd + fd;
+                                        if (cand < best_dist) best_dist = cand;
+                                    }
                                 }
                             }
                         }
                     }
-                }
 
-                answers[qid] = (best_dist == UINT64_MAX) ? -1 : (int64_t)best_dist;
-                map_f.clear();
-                map_b.clear();
-                pq_f.clear();
-                pq_b.clear();
+                    answers[qid] = (best_dist == UINT64_MAX) ? -1 : (int64_t)best_dist;
+                    map_f.clear();
+                    map_b.clear();
+                    pq_f.clear();
+                    pq_b.clear();
+                }
             }
         });
     }
@@ -427,19 +416,18 @@ int main(int argc, char **argv) {
     char out_path[1024];
     snprintf(out_path, sizeof(out_path), "%s/distances.txt", out_dir);
 
-    FILE *out = fopen(out_path, "wb");
+    FILE *fout = fopen(out_path, "wb");
     char *out_buf = (char *)malloc(1024 * 1024);
-    setvbuf(out, out_buf, _IOFBF, 1024 * 1024);
-    char row[32];
-    for (size_t i = 0; i < num_queries; i++) {
-        char *rp = fast_i64(row, answers[i]);
-        *rp++ = '\n';
-        fwrite(row, 1, rp - row, out);
+    setvbuf(fout, out_buf, _IOFBF, 1024 * 1024);
+
+    char line_buf[32];
+    for (size_t qid = 0; qid < num_queries; qid++) {
+        char *cur = fast_i64(line_buf, answers[qid]);
+        *cur++ = '\n';
+        fwrite(line_buf, 1, cur - line_buf, fout);
     }
-    fclose(out);
+    fclose(fout);
     free(out_buf);
 
-    double ms = std::chrono::duration<double, std::milli>(std::chrono::high_resolution_clock::now() - t_start).count();
-    printf("Track D Multi-threaded Parallel CSR Total Time: %.2f ms\n", ms);
     return 0;
 }
