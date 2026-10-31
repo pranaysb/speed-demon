@@ -227,14 +227,10 @@ int main(int argc, char **argv) {
             int last_hour_idx = -1;
             L1CacheEntry l1_cache[4096] = {};
 
-            const uint8_t *last_evict = p;
+            
 
             while (p < end) {
-                // Incremental page cache eviction: drop pages every 512KB
-                if (__builtin_expect((size_t)(p - last_evict) >= 524288, 0)) {
-                    madvise((void *)last_evict, p - last_evict, MADV_DONTNEED);
-                    last_evict = p;
-                }
+
 
                 uint64_t cur_hour_prefix;
                 memcpy(&cur_hour_prefix, p + 5, 8);
@@ -297,9 +293,7 @@ int main(int argc, char **argv) {
                 hh.tail->items[hh.tail_count++] = {lat, (uint16_t)(ep_id | is_err)};
                 hh.total_count++;
             }
-            if (p > last_evict) {
-                madvise((void *)last_evict, p - last_evict, MADV_DONTNEED);
-            }
+
         });
     }
     for (auto &w : workers) w.join();
@@ -382,10 +376,7 @@ int main(int argc, char **argv) {
                             uint32_t pos = ep_cur[ep]++;
                             sorted_latencies[pos] = blk->items[i].lat;
                         }
-                        ItemBlock *next_blk = blk->next;
-                        // Release block memory immediately
-                        madvise(blk, sizeof(ItemBlock), MADV_DONTNEED);
-                        blk = next_blk;
+                        blk = blk->next;
                     }
                 }
 
