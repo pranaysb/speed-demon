@@ -258,6 +258,13 @@ struct DocChunk {
     uint32_t start_doc_id;
 };
 
+struct alignas(16) DictCacheEntry {
+    uint64_t hash;
+    int32_t term_id;
+    uint16_t len;
+    uint16_t pad;
+};
+
 int main(int argc, char **argv) {
 #if defined(__linux__)
     mallopt(M_ARENA_MAX, 1);
@@ -272,6 +279,7 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[i], "--out") == 0 && i + 1 < argc) out_dir = argv[++i];
     }
 
+    
     // 1. Read queries and pre-parse
     char queries_path[1024];
     snprintf(queries_path, sizeof(queries_path), "%s/queries.txt", data_dir);
@@ -371,6 +379,7 @@ int main(int argc, char **argv) {
         }
     }
 
+    
     // 2. Open docs.txt and partition directly across threads
     char docs_path[1024];
     snprintf(docs_path, sizeof(docs_path), "%s/docs.txt", data_dir);
@@ -432,6 +441,7 @@ int main(int argc, char **argv) {
         workers.emplace_back([tid, &chunks, d_data, num_terms, &query_dict, &thread_counts, &doc_offset_arr, &doc_len_arr]() {
             auto &counts = thread_counts[tid];
             std::vector<uint32_t> last_doc_seen(num_terms, UINT32_MAX);
+            DictCacheEntry tl_cache[2048] = {};
 
             const uint8_t *p = d_data + chunks[tid].start_offset;
             const uint8_t *p_end = d_data + chunks[tid].end_offset;
@@ -464,7 +474,15 @@ int main(int argc, char **argv) {
                         tp++;
                     }
 
-                    int32_t tid_val = query_dict.find_by_hash(h, tok_len);
+                    uint32_t c_idx = (uint32_t)h & 2047;
+                    int32_t tid_val;
+                    if (tl_cache[c_idx].hash == h && tl_cache[c_idx].len == tok_len) {
+                        tid_val = tl_cache[c_idx].term_id;
+                    } else {
+                        tid_val = query_dict.find_by_hash(h, tok_len);
+                        tl_cache[c_idx] = {h, tid_val, tok_len, 0};
+                    }
+
                     if (tid_val >= 0 && last_doc_seen[tid_val] != cur_doc) {
                         last_doc_seen[tid_val] = cur_doc;
                         counts[tid_val]++;
@@ -477,6 +495,7 @@ int main(int argc, char **argv) {
     for (auto &w : workers) w.join();
     workers.clear();
 
+    
     // Compute CSR offsets
     std::vector<uint32_t> term_offsets(num_terms + 1, 0);
     std::vector<std::vector<uint32_t>> thread_write_ptrs(num_threads);
@@ -503,11 +522,13 @@ int main(int argc, char **argv) {
     // Allocate flat postings array
     uint32_t *all_postings = (uint32_t *)malloc(total_postings * sizeof(uint32_t));
 
+    
     // Pass 2: Write doc_ids into contiguous slices
     for (unsigned int tid = 0; tid < num_threads; tid++) {
         workers.emplace_back([tid, &chunks, d_data, num_terms, &query_dict, &thread_write_ptrs, all_postings]() {
             auto &wr = thread_write_ptrs[tid];
             std::vector<uint32_t> last_doc_seen(num_terms, UINT32_MAX);
+            DictCacheEntry tl_cache[2048] = {};
 
             const uint8_t *p = d_data + chunks[tid].start_offset;
             const uint8_t *p_end = d_data + chunks[tid].end_offset;
@@ -537,7 +558,15 @@ int main(int argc, char **argv) {
                         tp++;
                     }
 
-                    int32_t tid_val = query_dict.find_by_hash(h, tok_len);
+                    uint32_t c_idx = (uint32_t)h & 2047;
+                    int32_t tid_val;
+                    if (tl_cache[c_idx].hash == h && tl_cache[c_idx].len == tok_len) {
+                        tid_val = tl_cache[c_idx].term_id;
+                    } else {
+                        tid_val = query_dict.find_by_hash(h, tok_len);
+                        tl_cache[c_idx] = {h, tid_val, tok_len, 0};
+                    }
+
                     if (tid_val >= 0 && last_doc_seen[tid_val] != cur_doc) {
                         last_doc_seen[tid_val] = cur_doc;
                         uint32_t pos = wr[tid_val]++;
@@ -553,6 +582,7 @@ int main(int argc, char **argv) {
     thread_write_ptrs.clear();
     madvise((void *)d_data, d_size, MADV_DONTNEED);
 
+    
     // 3. Answer queries
     struct ThreadOutBuf {
         std::vector<char> buf;
@@ -570,7 +600,6 @@ int main(int argc, char **argv) {
             out_vec.resize((end_q - start_q) * 96);
             char *out_ptr = out_vec.data();
 
-            // Reusable buffers: 2 buffers per thread instead of 4
             uint32_t *buf_a = (uint32_t *)malloc(MAX_DOCS * sizeof(uint32_t));
             uint32_t *buf_b = (uint32_t *)malloc(MAX_DOCS * sizeof(uint32_t));
             std::vector<uint32_t> matches;
@@ -703,6 +732,7 @@ int main(int argc, char **argv) {
     }
     for (auto &w : workers) w.join();
 
+    
     // 4. Output results
     mkdir(out_dir, 0777);
     char out_path[1024];
@@ -723,5 +753,5 @@ int main(int argc, char **argv) {
     munmap((void *)d_data, d_size);
     close(d_fd);
 
-    return 0;
+            return 0;
 }
