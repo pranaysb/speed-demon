@@ -273,32 +273,36 @@ int main(int argc, char **argv) {
     munmap((void *)data, file_size);
     close(fd);
 
-    // SERIALIZED copy: only 1 thread allocates FinalItem while TempItem is alive, then munmaps TempItem!
+    // Parallel partition across all threads
     for (unsigned int t = 0; t < num_threads; t++) {
-        size_t n = thread_recs[t];
-        thread_final_bytes[t] = n * sizeof(FinalItem);
-        FinalItem *part = (FinalItem *)mmap(NULL, thread_final_bytes[t], PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
-        thread_partitioned[t] = part;
+        workers.emplace_back([t, &thread_recs, &thread_final_bytes, &thread_partitioned,
+                              &thread_hour_offsets, &thread_hour_counts, &thread_bufs, &thread_buf_bytes]() {
+            size_t n = thread_recs[t];
+            thread_final_bytes[t] = n * sizeof(FinalItem);
+            FinalItem *part = (FinalItem *)mmap(NULL, thread_final_bytes[t], PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+            thread_partitioned[t] = part;
 
-        auto &h_offsets = thread_hour_offsets[t];
-        auto &h_counts = thread_hour_counts[t];
-        for (int hr = 0; hr < 72; hr++) {
-            h_offsets[hr + 1] = h_offsets[hr] + h_counts[hr];
-        }
-        uint32_t cur[72];
-        memcpy(cur, h_offsets.data(), sizeof(cur));
+            auto &h_offsets = thread_hour_offsets[t];
+            auto &h_counts = thread_hour_counts[t];
+            for (int hr = 0; hr < 72; hr++) {
+                h_offsets[hr + 1] = h_offsets[hr] + h_counts[hr];
+            }
+            uint32_t cur[72];
+            memcpy(cur, h_offsets.data(), sizeof(cur));
 
-        const TempItem *src = thread_bufs[t];
-        for (size_t i = 0; i < n; i++) {
-            uint8_t hr = src[i].hour_idx;
-            uint32_t pos = cur[hr]++;
-            part[pos] = {src[i].lat, src[i].ep_code};
-        }
+            const TempItem *src = thread_bufs[t];
+            for (size_t i = 0; i < n; i++) {
+                uint8_t hr = src[i].hour_idx;
+                uint32_t pos = cur[hr]++;
+                part[pos] = {src[i].lat, src[i].ep_code};
+            }
 
-        // Munmap thread_bufs[t] IMMEDIATELY before next thread allocates!
-        munmap(thread_bufs[t], thread_buf_bytes[t]);
-        thread_bufs[t] = nullptr;
+            munmap(thread_bufs[t], thread_buf_bytes[t]);
+            thread_bufs[t] = nullptr;
+        });
     }
+    for (auto &w : workers) w.join();
+    workers.clear();
 
     // Sort endpoints
     std::vector<uint16_t> sorted_endpoint_ids(g_num_endpoints);

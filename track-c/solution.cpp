@@ -18,7 +18,47 @@
 
 #if defined(__x86_64__) || defined(_M_X64)
 #include <immintrin.h>
+#elif defined(__ARM_NEON)
+#include <arm_neon.h>
 #endif
+
+static inline const uint8_t* find_char_simd(const uint8_t *p, const uint8_t *end, uint8_t target) {
+#if defined(__AVX2__)
+    __m256i q256 = _mm256_set1_epi8(target);
+    while (p + 32 <= end) {
+        __m256i v = _mm256_loadu_si256((const __m256i *)p);
+        uint32_t mask = (uint32_t)_mm256_movemask_epi8(_mm256_cmpeq_epi8(v, q256));
+        if (mask != 0) {
+            return p + __builtin_ctz(mask);
+        }
+        p += 32;
+    }
+#endif
+#if defined(__x86_64__) || defined(_M_X64)
+    __m128i q128 = _mm_set1_epi8(target);
+    while (p + 16 <= end) {
+        __m128i v = _mm_loadu_si128((const __m128i *)p);
+        uint32_t mask = _mm_movemask_epi8(_mm_cmpeq_epi8(v, q128));
+        if (mask != 0) {
+            return p + __builtin_ctz(mask);
+        }
+        p += 16;
+    }
+#elif defined(__ARM_NEON)
+    uint8x16_t q = vdupq_n_u8(target);
+    while (p + 16 <= end) {
+        uint8x16_t v = vld1q_u8(p);
+        uint8x16_t cmp = vceqq_u8(v, q);
+        uint64_t lo = vgetq_lane_u64(vreinterpretq_u64_u8(cmp), 0);
+        uint64_t hi = vgetq_lane_u64(vreinterpretq_u64_u8(cmp), 1);
+        if (lo) return p + (__builtin_ctzll(lo) >> 3);
+        if (hi) return p + 8 + (__builtin_ctzll(hi) >> 3);
+        p += 16;
+    }
+#endif
+    while (p < end && *p != target) p++;
+    return p;
+}
 
 static inline char* format_cents(char *buf, int64_t cents) {
     if (cents < 0) {
@@ -284,72 +324,60 @@ int main(int argc, char **argv) {
                 if (p < end && *p == '"') {
                     p++;
                     while (p < end) {
-                        if (*p == '"') {
+                        const uint8_t *next_q = find_char_simd(p, end, '"');
+                        size_t span = next_q - p;
+                        name_len += span;
+                        for (size_t i = 0; i < span; i++) {
+                            n_hash = (n_hash ^ p[i]) * 0x100000001b3ULL;
+                        }
+                        p = next_q;
+                        if (p < end) {
                             if (p + 1 < end && *(p + 1) == '"') {
                                 n_hash = (n_hash ^ '"') * 0x100000001b3ULL;
                                 name_len++;
                                 p += 2;
                             } else {
-                                p++;
+                                p++; // closing quote
                                 break;
                             }
-                        } else {
-                            n_hash = (n_hash ^ *p) * 0x100000001b3ULL;
-                            name_len++;
-                            p++;
                         }
                     }
                     if (p < end && *p == ',') p++;
                 } else {
-                    const uint8_t *nc = (const uint8_t *)memchr(p, ',', end - p);
-                    if (nc) {
-                        name_len = nc - p;
-                        for (size_t i = 0; i < name_len; i++) {
-                            n_hash = (n_hash ^ p[i]) * 0x100000001b3ULL;
-                        }
-                        p = nc + 1;
-                    } else {
-                        while (p < end && *p != ',') {
-                            n_hash = (n_hash ^ *p) * 0x100000001b3ULL;
-                            name_len++;
-                            p++;
-                        }
-                        if (p < end && *p == ',') p++;
+                    const uint8_t *nc = find_char_simd(p, end, ',');
+                    name_len = nc - p;
+                    for (size_t i = 0; i < name_len; i++) {
+                        n_hash = (n_hash ^ p[i]) * 0x100000001b3ULL;
                     }
+                    p = nc;
+                    if (p < end && *p == ',') p++;
                 }
                 n_hash ^= name_len;
 
-                // 3. note
+                // 3. note (SIMD accelerated)
                 uint64_t note_len = 0;
                 if (p < end && *p == '"') {
                     p++;
                     while (p < end) {
-                        if (*p == '"') {
+                        const uint8_t *next_q = find_char_simd(p, end, '"');
+                        note_len += (next_q - p);
+                        p = next_q;
+                        if (p < end) {
                             if (p + 1 < end && *(p + 1) == '"') {
                                 note_len++;
                                 p += 2;
                             } else {
-                                p++;
+                                p++; // closing quote
                                 break;
                             }
-                        } else {
-                            note_len++;
-                            p++;
                         }
                     }
                     if (p < end && *p == ',') p++;
                 } else {
-                    const uint8_t *nc = (const uint8_t *)memchr(p, ',', end - p);
-                    if (nc) {
-                        note_len = nc - p;
-                        p = nc + 1;
-                    } else {
-                        while (p < end && *p != ',') {
-                            note_len++;
-                            p++;
-                        }
-                        if (p < end && *p == ',') p++;
-                    }
+                    const uint8_t *nc = find_char_simd(p, end, ',');
+                    note_len = nc - p;
+                    p = nc;
+                    if (p < end && *p == ',') p++;
                 }
 
                 // 4. region_id
@@ -360,7 +388,7 @@ int main(int argc, char **argv) {
                 }
                 if (p < end && *p == ',') p++;
 
-                // 5. amount
+                // 5. amount (branchless fraction)
                 int64_t sign = 1;
                 if (p < end && *p == '-') {
                     sign = -1;
@@ -372,16 +400,8 @@ int main(int argc, char **argv) {
                     p++;
                 }
                 if (p < end && *p == '.') p++;
-                int64_t frac = 0;
-                if (p < end && *p >= '0' && *p <= '9') {
-                    frac = (*p - '0') * 10;
-                    p++;
-                    if (p < end && *p >= '0' && *p <= '9') {
-                        frac += (*p - '0');
-                        p++;
-                    }
-                }
-                int64_t cents = sign * (whole * 100 + frac);
+                int64_t cents = sign * (whole * 100 + (p[0] - '0') * 10 + (p[1] - '0'));
+                p += 2;
 
                 if (p < end && *p == '\r') p++;
                 if (p < end && *p == '\n') p++;

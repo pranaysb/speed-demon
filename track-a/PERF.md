@@ -11,7 +11,8 @@ Every step from the reference to your final version, each with the live-board ru
 | 4 | Pinned multi-thread radix scatter & zero-buffer latency sort | run-f5383a40b2f0 | 0.0596 | 63.7 | 67.1 |
 | 5 | SIMD Vector Delimiter Scan & 1024-Entry L1 Endpoint Cache: Replaced character-by-character loops with AVX2/SSE2 `memchr` vector scans, branchless direct method skip, and 1024-entry direct-mapped L1 cache for instant endpoint interning. Best Falkenstein wall time $T = 0.0578$s ($57.8\text{ ms}$, $K_a = 22.24$). | run-5e3b5aee4c55 | 0.0578 | 62.1 | 67.36 |
 | 6 | In-Place Per-Thread Partition & Bit-Packed 6-Byte Records: Compressed final item record to 6 bytes ({lat: uint32_t, ep_code: uint16_t} with bit 15 error flag), eliminated 19MB global buffer, atomic dynamic work-stealing queue (`std::atomic<int> next_hour`) for load-balanced percentile sorting. All-time high score $K_a = 22.70$. | run-641c67f02dc2 | 0.0582 | 53.1 | 67.80 |
-| 7 | Serialized Memory Hand-off & Tight Buffer Sizing: Serialized thread counting-sort copy with immediate `munmap` per thread, sizing scratch buffers to exact line bounds. Slashes peak resident memory from 53MB down to ~28MB. | pending | | | |
+| 7 | Memory Hand-off & Tight Buffer Sizing: Sized scratch buffers to exact line bounds. Slashed peak resident memory from 53MB down to 42.8MB. | run-6a35c6269422 | 0.0729 | 42.8 | 66.28 |
+| 8 | Restored Parallel Partition & Immediate Buffer Munmap: Restored 12-thread parallel partition across all hardware threads while preserving immediate scratch unmapping, eliminating serial thread bottlenecks (23% local speedup). | pending | | | |
 
 ## Approach & Architectural Highlights
 1. **Zero-Copy File Mapping**: POSIX `mmap()` backed by `MADV_SEQUENTIAL | MADV_WILLNEED` with clean shared pages.
