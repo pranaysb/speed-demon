@@ -16,6 +16,10 @@
 #include <malloc.h>
 #endif
 
+#if defined(__x86_64__) || defined(_M_X64)
+#include <immintrin.h>
+#endif
+
 static inline char* format_cents(char *buf, int64_t cents) {
     if (cents < 0) {
         *buf++ = '-';
@@ -76,44 +80,51 @@ struct FinalCountryAgg {
     uint64_t note_bytes = 0;
 };
 
-// Global name hash table to assign dense name_id (0..100,520)
-static constexpr size_t NAME_MAP_CAP = 262144; // Power of 2
+// Global lock-free hash table to assign dense name_id (0..262,143)
+static constexpr size_t NAME_MAP_CAP = 524288; // 512K slots
 static constexpr size_t NAME_MAP_MASK = NAME_MAP_CAP - 1;
 
-struct NameMapEntry {
-    std::atomic<uint64_t> hash{0};
-    uint32_t name_id{0};
-};
-
-static NameMapEntry g_name_map[NAME_MAP_CAP];
-static std::atomic<uint32_t> g_next_name_id{1}; // 1-based, 0 is empty
+static std::atomic<uint64_t> g_name_map_keys[NAME_MAP_CAP];
+static std::atomic<uint32_t> g_name_map_vals[NAME_MAP_CAP];
+static std::atomic<uint32_t> g_next_name_id{1}; // 1-based
 
 static inline uint32_t get_or_insert_name_id(uint64_t h) {
-    if (__builtin_expect(h == 0 || h == 1, 0)) h = 0x517cc1b727220a95ULL;
+    if (__builtin_expect(h == 0, 0)) h = 0x517cc1b727220a95ULL;
     size_t idx = h & NAME_MAP_MASK;
     while (true) {
-        uint64_t cur = g_name_map[idx].hash.load(std::memory_order_acquire);
+        uint64_t cur = g_name_map_keys[idx].load(std::memory_order_relaxed);
         if (cur == h) {
-            return g_name_map[idx].name_id;
+            uint32_t v;
+            while ((v = g_name_map_vals[idx].load(std::memory_order_acquire)) == 0) {
+#if defined(__x86_64__) || defined(_M_X64)
+                _mm_pause();
+#endif
+            }
+            return v;
         }
         if (cur == 0) {
             uint64_t expected = 0;
-            if (g_name_map[idx].hash.compare_exchange_strong(expected, 1ULL, std::memory_order_acquire)) {
+            if (g_name_map_keys[idx].compare_exchange_strong(expected, h, std::memory_order_relaxed)) {
                 uint32_t nid = g_next_name_id.fetch_add(1, std::memory_order_relaxed);
-                g_name_map[idx].name_id = nid;
-                g_name_map[idx].hash.store(h, std::memory_order_release);
+                g_name_map_vals[idx].store(nid, std::memory_order_release);
                 return nid;
             }
             if (expected == h) {
-                return g_name_map[idx].name_id;
+                uint32_t v;
+                while ((v = g_name_map_vals[idx].load(std::memory_order_acquire)) == 0) {
+#if defined(__x86_64__) || defined(_M_X64)
+                    _mm_pause();
+#endif
+                }
+                return v;
             }
         }
         idx = (idx + 1) & NAME_MAP_MASK;
     }
 }
 
-// Country bitset: 131,072 bits = 2048 uint64_t words per country
-static constexpr size_t BITSET_WORDS = 2048;
+// Country bitset: 262,144 bits = 4096 uint64_t words per country
+static constexpr size_t BITSET_WORDS = 4096;
 static std::atomic<uint64_t> g_country_bitsets[256][BITSET_WORDS];
 
 int main(int argc, char **argv) {
