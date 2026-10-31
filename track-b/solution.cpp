@@ -466,13 +466,10 @@ int main(int argc, char **argv) {
 
             const uint8_t *p = d_data + chunks[tid].start_offset;
             const uint8_t *p_end = d_data + chunks[tid].end_offset;
-            uint32_t cur_doc = chunks[tid].start_doc_id; const uint8_t *last_evict = p;
+            uint32_t cur_doc = chunks[tid].start_doc_id; 
 
             while (p < p_end) {
-                if (__builtin_expect((size_t)(p - last_evict) >= 524288, 0)) {
-                    madvise((void *)last_evict, p - last_evict, MADV_DONTNEED);
-                    last_evict = p;
-                }
+
                 while (p < p_end && *p >= '0' && *p <= '9') p++;
                 if (p < p_end && *p == '\t') p++;
                 const uint8_t *text_start = p;
@@ -561,13 +558,10 @@ int main(int argc, char **argv) {
 
             const uint8_t *p = d_data + chunks[tid].start_offset;
             const uint8_t *p_end = d_data + chunks[tid].end_offset;
-            uint32_t cur_doc = chunks[tid].start_doc_id; const uint8_t *last_evict = p;
+            uint32_t cur_doc = chunks[tid].start_doc_id; 
 
             while (p < p_end) {
-                if (__builtin_expect((size_t)(p - last_evict) >= 524288, 0)) {
-                    madvise((void *)last_evict, p - last_evict, MADV_DONTNEED);
-                    last_evict = p;
-                }
+
                 while (p < p_end && *p >= '0' && *p <= '9') p++;
                 if (p < p_end && *p == '\t') p++;
                 const uint8_t *text_start = p;
@@ -623,7 +617,7 @@ int main(int argc, char **argv) {
     struct ThreadOutBuf {
         std::vector<char> buf;
     };
-    unsigned int q_threads = std::min(num_threads, 6u);
+    unsigned int q_threads = num_threads;
     std::vector<ThreadOutBuf> thread_out_bufs(q_threads);
     size_t query_chunk = (num_queries + q_threads - 1) / q_threads;
 
