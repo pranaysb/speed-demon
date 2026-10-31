@@ -58,21 +58,46 @@ static constexpr size_t EP_MAP_CAP = 16384;
 static constexpr size_t EP_MAP_MASK = EP_MAP_CAP - 1;
 static EndpointEntry g_ep_map[EP_MAP_CAP];
 
-[[maybe_unused]] static inline uint64_t fast_hash(const char *p, size_t len) {
-    uint64_t h = 0xcbf29ce484222325ULL ^ len;
+
+#if defined(__x86_64__) || defined(_M_X64)
+#include <immintrin.h>
+static inline uint64_t fast_hash(const char *p, size_t len) {
+    uint64_t crc = len;
     size_t i = 0;
     while (i + 8 <= len) {
-        uint64_t v;
-        memcpy(&v, p + i, 8);
-        h = (h ^ v) * 0x100000001b3ULL;
+        uint64_t v; memcpy(&v, p + i, 8);
+        crc = _mm_crc32_u64(crc, v);
         i += 8;
     }
     while (i < len) {
-        h = (h ^ (uint8_t)p[i]) * 0x100000001b3ULL;
+        crc = _mm_crc32_u8((uint32_t)crc, (uint8_t)p[i]);
         i++;
     }
+    return crc;
+}
+#elif defined(__aarch64__) || defined(_M_ARM64)
+#include <arm_acle.h>
+static inline uint64_t fast_hash(const char *p, size_t len) {
+    uint64_t crc = len;
+    size_t i = 0;
+    while (i + 8 <= len) {
+        uint64_t v; memcpy(&v, p + i, 8);
+        crc = __crc32d((uint32_t)crc, v);
+        i += 8;
+    }
+    while (i < len) {
+        crc = __crc32b((uint32_t)crc, (uint8_t)p[i]);
+        i++;
+    }
+    return crc;
+}
+#else
+static inline uint64_t fast_hash(const char *p, size_t len) {
+    uint64_t h = len;
+    for (size_t i = 0; i < len; i++) h = (h ^ (uint8_t)p[i]) * 0x100000001b3ULL;
     return h;
 }
+#endif
 
 static uint16_t get_or_insert_endpoint_with_hash(const char *p, size_t len, uint64_t h) {
     size_t idx = h & EP_MAP_MASK;
@@ -268,10 +293,9 @@ int main(int argc, char **argv) {
                 uint16_t is_err = (p[0] >= '5') ? 0x8000 : 0;
                 p += 4; // status + space
 
-                uint32_t lat = 0;
-                while (p < end && *p >= '0' && *p <= '9') {
-                    lat = lat * 10 + (*p - '0');
-                    p++;
+                uint32_t lat = *p++ - '0';
+                while (*p >= '0') {
+                    lat = lat * 10 + (*p++ - '0');
                 }
                 if (*p == '\r') p++;
                 if (*p == '\n') p++;
