@@ -212,7 +212,7 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[i], "--out") == 0 && i + 1 < argc) out_dir = argv[++i];
     }
 
-    auto t0 = std::chrono::high_resolution_clock::now();
+
 
     // 1. Read queries
     char queries_path[1024];
@@ -313,16 +313,15 @@ int main(int argc, char **argv) {
         size_t start_doc = tid * doc_chunk;
         size_t end_doc = std::min(start_doc + doc_chunk, num_docs);
 
-        workers.emplace_back([tid, start_doc, end_doc, &docs, &query_dict, &thread_counts]() {
+        workers.emplace_back([tid, start_doc, end_doc, num_terms, &docs, &query_dict, &thread_counts]() {
             auto &counts = thread_counts[tid];
             char term_buf[64];
-            std::vector<int32_t> doc_terms;
-            doc_terms.reserve(256);
+            std::vector<uint32_t> last_doc_seen(num_terms, UINT32_MAX);
 
             for (size_t d = start_doc; d < end_doc; d++) {
                 const uint8_t *tp = docs[d].ptr;
                 const uint8_t *tend = tp + docs[d].len;
-                doc_terms.clear();
+                uint32_t doc_id = (uint32_t)d;
 
                 while (tp < tend) {
                     while (tp < tend) {
@@ -348,14 +347,11 @@ int main(int argc, char **argv) {
                     }
 
                     int32_t tid_val = query_dict.find(term_buf, tlen);
-                    if (tid_val >= 0) doc_terms.push_back(tid_val);
+                    if (tid_val >= 0 && last_doc_seen[tid_val] != doc_id) {
+                        last_doc_seen[tid_val] = doc_id;
+                        counts[tid_val]++;
+                    }
                 }
-
-                if (doc_terms.size() > 1) {
-                    std::sort(doc_terms.begin(), doc_terms.end());
-                    doc_terms.erase(std::unique(doc_terms.begin(), doc_terms.end()), doc_terms.end());
-                }
-                for (int32_t t_id : doc_terms) counts[t_id]++;
             }
         });
     }
@@ -393,16 +389,15 @@ int main(int argc, char **argv) {
         size_t start_doc = tid * doc_chunk;
         size_t end_doc = std::min(start_doc + doc_chunk, num_docs);
 
-        workers.emplace_back([tid, start_doc, end_doc, &docs, &query_dict, &thread_write_ptrs, all_postings]() {
+        workers.emplace_back([tid, start_doc, end_doc, num_terms, &docs, &query_dict, &thread_write_ptrs, all_postings]() {
             auto &wr = thread_write_ptrs[tid];
             char term_buf[64];
-            std::vector<int32_t> doc_terms;
-            doc_terms.reserve(256);
+            std::vector<uint32_t> last_doc_seen(num_terms, UINT32_MAX);
 
             for (size_t d = start_doc; d < end_doc; d++) {
                 const uint8_t *tp = docs[d].ptr;
                 const uint8_t *tend = tp + docs[d].len;
-                doc_terms.clear();
+                uint32_t doc_id = (uint32_t)d;
 
                 while (tp < tend) {
                     while (tp < tend) {
@@ -428,16 +423,11 @@ int main(int argc, char **argv) {
                     }
 
                     int32_t tid_val = query_dict.find(term_buf, tlen);
-                    if (tid_val >= 0) doc_terms.push_back(tid_val);
-                }
-
-                if (doc_terms.size() > 1) {
-                    std::sort(doc_terms.begin(), doc_terms.end());
-                    doc_terms.erase(std::unique(doc_terms.begin(), doc_terms.end()), doc_terms.end());
-                }
-                for (int32_t t_id : doc_terms) {
-                    uint32_t pos = wr[t_id]++;
-                    all_postings[pos] = (uint32_t)d;
+                    if (tid_val >= 0 && last_doc_seen[tid_val] != doc_id) {
+                        last_doc_seen[tid_val] = doc_id;
+                        uint32_t pos = wr[tid_val]++;
+                        all_postings[pos] = doc_id;
+                    }
                 }
             }
         });
@@ -446,8 +436,7 @@ int main(int argc, char **argv) {
     workers.clear();
     thread_write_ptrs.clear();
 
-    auto t_idx = std::chrono::high_resolution_clock::now();
-    printf("CSR Index built: %u postings in %.2f ms\n", total_postings, std::chrono::duration<double, std::milli>(t_idx - t0).count());
+
 
     // 3. Answer queries
     size_t num_queries = queries.size();
@@ -616,7 +605,5 @@ int main(int argc, char **argv) {
     munmap((void *)d_data, d_size);
     close(d_fd);
 
-    auto t_fin = std::chrono::high_resolution_clock::now();
-    printf("Total Track B time: %.2f ms\n", std::chrono::duration<double, std::milli>(t_fin - t0).count());
     return 0;
 }

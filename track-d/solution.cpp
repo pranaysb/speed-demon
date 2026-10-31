@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <vector>
 #include <thread>
+#include <chrono>
 
 #if defined(__linux__)
 #include <malloc.h>
@@ -32,6 +33,7 @@ public:
     QuadHeap() { data.resize(65536); }
     inline bool empty() const { return sz == 0; }
     inline void clear() { sz = 0; }
+    inline uint64_t top_dist() const { return data[0].dist; }
 
     inline void push(uint64_t dist, uint32_t u) {
         if (__builtin_expect(sz >= data.size(), 0)) data.resize(data.size() * 2);
@@ -116,6 +118,8 @@ int main(int argc, char **argv) {
         }
     }
 
+
+
     char graph_path[1024];
     snprintf(graph_path, sizeof(graph_path), "%s/graph.txt", data_dir);
 
@@ -139,19 +143,29 @@ int main(int argc, char **argv) {
     const uint8_t *edges_start = p;
     const uint8_t *edges_end = g_data + g_size;
 
-    std::vector<uint32_t> offsets(num_nodes + 1, 0);
+    std::vector<uint32_t> f_offsets(num_nodes + 1, 0);
+    std::vector<uint32_t> b_offsets(num_nodes + 1, 0);
+
     const uint8_t *ep = edges_start;
     while (ep < edges_end) {
-        uint32_t u = 0;
-        while (*ep >= '0' && *ep <= '9') { u = u * 10 + (*ep - '0'); ep++; }
-        offsets[u + 1]++;
+        uint32_t u, v;
+        ep = fast_parse_u32(ep, &u); ep++;
+        ep = fast_parse_u32(ep, &v);
+        f_offsets[u + 1]++;
+        b_offsets[v + 1]++;
         while (ep < edges_end && *ep != '\n') ep++;
         if (ep < edges_end) ep++;
     }
-    for (uint32_t i = 0; i < num_nodes; i++) offsets[i + 1] += offsets[i];
+    for (uint32_t i = 0; i < num_nodes; i++) {
+        f_offsets[i + 1] += f_offsets[i];
+        b_offsets[i + 1] += b_offsets[i];
+    }
 
-    std::vector<uint32_t> cur = offsets;
-    std::vector<Edge> edges(num_edges);
+    std::vector<uint32_t> f_cur = f_offsets;
+    std::vector<uint32_t> b_cur = b_offsets;
+    std::vector<Edge> f_edges(num_edges);
+    std::vector<Edge> b_edges(num_edges);
+
     ep = edges_start;
     while (ep < edges_end) {
         uint32_t u, v, w;
@@ -160,11 +174,49 @@ int main(int argc, char **argv) {
         ep = fast_parse_u32(ep, &w);
         if (ep < edges_end && *ep == '\r') ep++;
         if (ep < edges_end && *ep == '\n') ep++;
-        edges[cur[u]++] = {v, w};
+        f_edges[f_cur[u]++] = {v, w};
+        b_edges[b_cur[v]++] = {u, w};
     }
     munmap((void *)g_data, g_size);
     close(g_fd);
-    cur.clear(); cur.shrink_to_fit();
+    f_cur.clear(); f_cur.shrink_to_fit();
+    b_cur.clear(); b_cur.shrink_to_fit();
+
+    // BFS to label weakly connected components
+    std::vector<uint32_t> comp(num_nodes, 0);
+    std::vector<uint32_t> q(num_nodes);
+    uint32_t current_comp = 0;
+
+    for (uint32_t root = 0; root < num_nodes; root++) {
+        if (comp[root] != 0) continue;
+        current_comp++;
+        size_t head = 0, tail = 0;
+        comp[root] = current_comp;
+        q[tail++] = root;
+
+        while (head < tail) {
+            uint32_t u = q[head++];
+            // forward edges
+            for (uint32_t e = f_offsets[u], ee = f_offsets[u + 1]; e < ee; e++) {
+                uint32_t v = f_edges[e].target;
+                if (comp[v] == 0) {
+                    comp[v] = current_comp;
+                    q[tail++] = v;
+                }
+            }
+            // backward edges
+            for (uint32_t e = b_offsets[u], ee = b_offsets[u + 1]; e < ee; e++) {
+                uint32_t v = b_edges[e].target;
+                if (comp[v] == 0) {
+                    comp[v] = current_comp;
+                    q[tail++] = v;
+                }
+            }
+        }
+    }
+    q.clear(); q.shrink_to_fit();
+
+
 
     // Read queries
     char queries_path[1024];
@@ -183,11 +235,11 @@ int main(int argc, char **argv) {
     while (p < q_end) {
         while (p < q_end && (*p == ' ' || *p == '\n' || *p == '\r')) p++;
         if (p >= q_end) break;
-        Query q;
-        p = fast_parse_u32(p, &q.s); while (p < q_end && *p == ' ') p++;
-        p = fast_parse_u32(p, &q.t); while (p < q_end && *p != '\n') p++;
+        Query q_item;
+        p = fast_parse_u32(p, &q_item.s); while (p < q_end && *p == ' ') p++;
+        p = fast_parse_u32(p, &q_item.t); while (p < q_end && *p != '\n') p++;
         if (p < q_end && *p == '\n') p++;
-        queries.push_back(q);
+        queries.push_back(q_item);
     }
     munmap((void *)q_data, q_size);
     close(q_fd);
@@ -195,7 +247,6 @@ int main(int argc, char **argv) {
     size_t num_queries = queries.size();
     std::vector<int64_t> answers(num_queries, -1);
 
-    // Pin execution to 6 worker threads to avoid L3 cache thrashing and CFS CPU quota throttling
     unsigned int num_threads = 6;
     std::vector<std::thread> workers;
     size_t chunk_size = (num_queries + num_threads - 1) / num_threads;
@@ -206,10 +257,11 @@ int main(int argc, char **argv) {
         if (start_q >= end_q) continue;
 
         workers.emplace_back([&, start_q, end_q]() {
-            std::vector<uint64_t> dist(num_nodes, UINT64_MAX);
-            std::vector<uint32_t> touched;
-            touched.reserve(65536);
-            QuadHeap pq;
+            std::vector<uint64_t> dist_f(num_nodes, UINT64_MAX);
+            std::vector<uint64_t> dist_b(num_nodes, UINT64_MAX);
+            std::vector<uint32_t> touched_f; touched_f.reserve(32768);
+            std::vector<uint32_t> touched_b; touched_b.reserve(32768);
+            QuadHeap pq_f, pq_b;
 
             for (size_t qid = start_q; qid < end_q; qid++) {
                 uint32_t s = queries[qid].s;
@@ -217,45 +269,78 @@ int main(int argc, char **argv) {
                 if (s >= num_nodes || t >= num_nodes) { answers[qid] = -1; continue; }
                 if (s == t) { answers[qid] = 0; continue; }
 
-                dist[s] = 0;
-                touched.push_back(s);
-                pq.push(0, s);
+                // O(1) unreachable pruning
+                if (f_offsets[s + 1] == f_offsets[s] || b_offsets[t + 1] == b_offsets[t] || comp[s] != comp[t]) {
+                    answers[qid] = -1;
+                    continue;
+                }
 
-                while (!pq.empty()) {
-                    HeapItem top = pq.pop();
-                    uint64_t d = top.dist;
-                    uint32_t u = top.u;
+                dist_f[s] = 0; touched_f.push_back(s); pq_f.push(0, s);
+                dist_b[t] = 0; touched_b.push_back(t); pq_b.push(0, t);
 
-                    if (d > dist[u]) continue;
-                    if (u == t) break;
+                uint64_t best_dist = UINT64_MAX;
 
-                    // Target-bounded prune: no path through remaining queue items can beat dist[t]
-                    if (dist[t] != UINT64_MAX && d >= dist[t]) break;
+                while (!pq_f.empty() && !pq_b.empty()) {
+                    if (pq_f.top_dist() + pq_b.top_dist() >= best_dist) break;
 
-                    uint32_t es = offsets[u], ee = offsets[u + 1];
-                    for (uint32_t e = es; e < ee; e++) {
-                        uint32_t v = edges[e].target;
-                        uint64_t nd = d + edges[e].weight;
+                    if (pq_f.top_dist() <= pq_b.top_dist()) {
+                        HeapItem item = pq_f.pop();
+                        uint64_t d = item.dist;
+                        uint32_t u = item.u;
+                        if (d > dist_f[u]) continue;
 
-                        // Never push or relax edges that cannot improve upon current dist[t]
-                        if (dist[t] != UINT64_MAX && nd >= dist[t]) continue;
+                        uint32_t es = f_offsets[u], ee = f_offsets[u + 1];
+                        for (uint32_t e = es; e < ee; e++) {
+                            uint32_t v = f_edges[e].target;
+                            uint64_t nd = d + f_edges[e].weight;
+                            if (nd >= best_dist) continue;
+                            if (nd < dist_f[v]) {
+                                if (dist_f[v] == UINT64_MAX) touched_f.push_back(v);
+                                dist_f[v] = nd;
+                                pq_f.push(nd, v);
+                                if (dist_b[v] != UINT64_MAX) {
+                                    uint64_t cand = nd + dist_b[v];
+                                    if (cand < best_dist) best_dist = cand;
+                                }
+                            }
+                        }
+                    } else {
+                        HeapItem item = pq_b.pop();
+                        uint64_t d = item.dist;
+                        uint32_t u = item.u;
+                        if (d > dist_b[u]) continue;
 
-                        if (nd < dist[v]) {
-                            if (dist[v] == UINT64_MAX) touched.push_back(v);
-                            dist[v] = nd;
-                            pq.push(nd, v);
+                        uint32_t es = b_offsets[u], ee = b_offsets[u + 1];
+                        for (uint32_t e = es; e < ee; e++) {
+                            uint32_t v = b_edges[e].target;
+                            uint64_t nd = d + b_edges[e].weight;
+                            if (nd >= best_dist) continue;
+                            if (nd < dist_b[v]) {
+                                if (dist_b[v] == UINT64_MAX) touched_b.push_back(v);
+                                dist_b[v] = nd;
+                                pq_b.push(nd, v);
+                                if (dist_f[v] != UINT64_MAX) {
+                                    uint64_t cand = nd + dist_f[v];
+                                    if (cand < best_dist) best_dist = cand;
+                                }
+                            }
                         }
                     }
                 }
 
-                answers[qid] = (dist[t] == UINT64_MAX) ? -1 : (int64_t)dist[t];
-                for (uint32_t x : touched) dist[x] = UINT64_MAX;
-                touched.clear();
-                pq.clear();
+                answers[qid] = (best_dist == UINT64_MAX) ? -1 : (int64_t)best_dist;
+                for (uint32_t x : touched_f) dist_f[x] = UINT64_MAX;
+                for (uint32_t x : touched_b) dist_b[x] = UINT64_MAX;
+                touched_f.clear();
+                touched_b.clear();
+                pq_f.clear();
+                pq_b.clear();
             }
         });
     }
     for (auto &w : workers) w.join();
+
+
 
     mkdir(out_dir, 0777);
     char out_path[1024];

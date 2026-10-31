@@ -141,7 +141,7 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[i], "--out") == 0 && i + 1 < argc) out_dir = argv[++i];
     }
 
-    auto t0 = std::chrono::high_resolution_clock::now();
+
     init_hour_strings();
 
     char input_path[1024];
@@ -397,7 +397,5 @@ int main(int argc, char **argv) {
     free(out_buf);
     free(all_items);
 
-    auto t1 = std::chrono::high_resolution_clock::now();
-    printf("Radix Scatter Track A: %.2f ms\n", std::chrono::duration<double, std::milli>(t1 - t0).count());
     return 0;
 }
