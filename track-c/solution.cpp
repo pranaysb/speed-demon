@@ -11,7 +11,6 @@
 #include <string>
 #include <thread>
 #include <atomic>
-#include <chrono>
 
 #if defined(__linux__)
 #include <malloc.h>
@@ -76,6 +75,46 @@ struct FinalCountryAgg {
     uint64_t name_bytes = 0;
     uint64_t note_bytes = 0;
 };
+
+// Global name hash table to assign dense name_id (0..100,520)
+static constexpr size_t NAME_MAP_CAP = 262144; // Power of 2
+static constexpr size_t NAME_MAP_MASK = NAME_MAP_CAP - 1;
+
+struct NameMapEntry {
+    std::atomic<uint64_t> hash{0};
+    uint32_t name_id{0};
+};
+
+static NameMapEntry g_name_map[NAME_MAP_CAP];
+static std::atomic<uint32_t> g_next_name_id{1}; // 1-based, 0 is empty
+
+static inline uint32_t get_or_insert_name_id(uint64_t h) {
+    if (__builtin_expect(h == 0 || h == 1, 0)) h = 0x517cc1b727220a95ULL;
+    size_t idx = h & NAME_MAP_MASK;
+    while (true) {
+        uint64_t cur = g_name_map[idx].hash.load(std::memory_order_acquire);
+        if (cur == h) {
+            return g_name_map[idx].name_id;
+        }
+        if (cur == 0) {
+            uint64_t expected = 0;
+            if (g_name_map[idx].hash.compare_exchange_strong(expected, 1ULL, std::memory_order_acquire)) {
+                uint32_t nid = g_next_name_id.fetch_add(1, std::memory_order_relaxed);
+                g_name_map[idx].name_id = nid;
+                g_name_map[idx].hash.store(h, std::memory_order_release);
+                return nid;
+            }
+            if (expected == h) {
+                return g_name_map[idx].name_id;
+            }
+        }
+        idx = (idx + 1) & NAME_MAP_MASK;
+    }
+}
+
+// Country bitset: 131,072 bits = 2048 uint64_t words per country
+static constexpr size_t BITSET_WORDS = 2048;
+static std::atomic<uint64_t> g_country_bitsets[256][BITSET_WORDS];
 
 int main(int argc, char **argv) {
 #if defined(__linux__)
@@ -207,28 +246,13 @@ int main(int argc, char **argv) {
     chunk_ends[num_threads - 1] = data + file_size;
 
     std::vector<std::vector<ThreadCountryAgg>> thread_aggs(num_threads, std::vector<ThreadCountryAgg>(num_countries));
-    std::vector<uint64_t *> thread_hashes(num_threads);
-    std::vector<size_t> thread_hash_bytes(num_threads);
-    std::vector<size_t> thread_recs(num_threads);
-    std::vector<std::vector<uint32_t>> thread_c_offsets(num_threads, std::vector<uint32_t>(num_countries + 1, 0));
-
-    for (unsigned int t = 0; t < num_threads; t++) {
-        size_t chunk_bytes = chunk_ends[t] - chunk_starts[t];
-        size_t max_recs = (chunk_bytes / 45) + 10000;
-        thread_hash_bytes[t] = max_recs * sizeof(uint64_t);
-        thread_hashes[t] = (uint64_t *)mmap(NULL, thread_hash_bytes[t], PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
-    }
-
     std::vector<std::thread> workers;
 
     for (unsigned int t = 0; t < num_threads; t++) {
-        workers.emplace_back([t, &thread_aggs, &thread_hashes,
-                              &thread_recs, &thread_c_offsets,
-                              &chunk_starts, &chunk_ends, &region_to_cid, num_countries]() {
+        workers.emplace_back([t, &thread_aggs, &chunk_starts, &chunk_ends, &region_to_cid]() {
             const uint8_t *p = chunk_starts[t];
             const uint8_t *end = chunk_ends[t];
             auto &aggs = thread_aggs[t];
-            uint64_t *hptr = thread_hashes[t];
             size_t reg_limit = region_to_cid.size();
 
             while (p < end) {
@@ -367,23 +391,15 @@ int main(int argc, char **argv) {
                 ca.name_bytes += name_len;
                 ca.note_bytes += note_len;
 
-                *hptr++ = ((uint64_t)cid << 56) | (n_hash & 0x00FFFFFFFFFFFFFFULL);
+                // Lookup dense name ID and set in country bitset
+                uint32_t nid = get_or_insert_name_id(n_hash);
+                uint32_t word_idx = nid / 64;
+                uint64_t bit_mask = 1ULL << (nid % 64);
+                uint64_t old_val = g_country_bitsets[cid][word_idx].load(std::memory_order_relaxed);
+                if ((old_val & bit_mask) == 0) {
+                    g_country_bitsets[cid][word_idx].fetch_or(bit_mask, std::memory_order_relaxed);
+                }
             }
-            size_t n = hptr - thread_hashes[t];
-            thread_recs[t] = n;
-
-            // In-place sort of 64-bit combined values
-            uint64_t *base = thread_hashes[t];
-            std::sort(base, base + n);
-
-            // Compute country offsets in-place
-            auto &offsets = thread_c_offsets[t];
-            size_t cur_idx = 0;
-            for (size_t c = 0; c < num_countries; c++) {
-                while (cur_idx < n && (base[cur_idx] >> 56) < c) cur_idx++;
-                offsets[c] = (uint32_t)cur_idx;
-            }
-            offsets[num_countries] = (uint32_t)n;
         });
     }
     for (auto &w : workers) w.join();
@@ -396,57 +412,33 @@ int main(int argc, char **argv) {
     std::vector<FinalCountryAgg> final_aggs(num_countries);
     for (size_t c = 0; c < num_countries; c++) {
         final_aggs[c].key = country_names[c];
-    }
+        FinalCountryAgg &fa = final_aggs[c];
 
-    std::atomic<size_t> next_country{0};
-
-    for (unsigned int t = 0; t < num_threads; t++) {
-        workers.emplace_back([&next_country, num_countries, num_threads, &final_aggs, &thread_aggs,
-                              &thread_hashes, &thread_c_offsets]() {
-            std::vector<uint64_t> country_hashes;
-            country_hashes.reserve(131072);
-
-            size_t c;
-            while ((c = next_country.fetch_add(1)) < num_countries) {
-                FinalCountryAgg &fa = final_aggs[c];
-                country_hashes.clear();
-
-                for (unsigned int thr = 0; thr < num_threads; thr++) {
-                    auto &ca = thread_aggs[thr][c];
-                    if (ca.count == 0) continue;
-                    fa.count += ca.count;
-                    fa.id_sum += ca.id_sum;
-                    fa.amount_sum += ca.amount_sum;
-                    if (fa.count == ca.count) {
-                        fa.amount_min = ca.amount_min;
-                        fa.amount_max = ca.amount_max;
-                    } else {
-                        if (ca.amount_min < fa.amount_min) fa.amount_min = ca.amount_min;
-                        if (ca.amount_max > fa.amount_max) fa.amount_max = ca.amount_max;
-                    }
-                    fa.name_bytes += ca.name_bytes;
-                    fa.note_bytes += ca.note_bytes;
-
-                    uint32_t start_off = thread_c_offsets[thr][c];
-                    uint32_t end_off = thread_c_offsets[thr][c + 1];
-                    if (end_off > start_off) {
-                        const uint64_t *p = &thread_hashes[thr][start_off];
-                        country_hashes.insert(country_hashes.end(), p, p + (end_off - start_off));
-                    }
-                }
-
-                if (!country_hashes.empty()) {
-                    std::sort(country_hashes.begin(), country_hashes.end());
-                    fa.names_distinct = std::unique(country_hashes.begin(), country_hashes.end()) - country_hashes.begin();
-                }
+        for (unsigned int thr = 0; thr < num_threads; thr++) {
+            auto &ca = thread_aggs[thr][c];
+            if (ca.count == 0) continue;
+            fa.count += ca.count;
+            fa.id_sum += ca.id_sum;
+            fa.amount_sum += ca.amount_sum;
+            if (fa.count == ca.count) {
+                fa.amount_min = ca.amount_min;
+                fa.amount_max = ca.amount_max;
+            } else {
+                if (ca.amount_min < fa.amount_min) fa.amount_min = ca.amount_min;
+                if (ca.amount_max > fa.amount_max) fa.amount_max = ca.amount_max;
             }
-        });
-    }
-    for (auto &w : workers) w.join();
-    workers.clear();
+            fa.name_bytes += ca.name_bytes;
+            fa.note_bytes += ca.note_bytes;
+        }
 
-    for (unsigned int t = 0; t < num_threads; t++) {
-        munmap(thread_hashes[t], thread_hash_bytes[t]);
+        if (fa.count > 0) {
+            uint64_t distinct = 0;
+            for (size_t w = 0; w < BITSET_WORDS; w++) {
+                uint64_t val = g_country_bitsets[c][w].load(std::memory_order_relaxed);
+                if (val) distinct += __builtin_popcountll(val);
+            }
+            fa.names_distinct = distinct;
+        }
     }
 
     // Sort final output by country code

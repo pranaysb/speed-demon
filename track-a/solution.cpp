@@ -12,7 +12,6 @@
 #include <thread>
 #include <mutex>
 #include <atomic>
-#include <chrono>
 
 #if defined(__linux__)
 #include <malloc.h>
@@ -194,17 +193,15 @@ int main(int argc, char **argv) {
 
     for (unsigned int t = 0; t < num_threads; t++) {
         size_t chunk_bytes = chunk_ends[t] - chunk_starts[t];
-        size_t max_recs = (chunk_bytes / 55) + 5000;
+        size_t max_recs = (chunk_bytes / 65) + 5000;
         thread_buf_bytes[t] = max_recs * sizeof(TempItem);
-        thread_final_bytes[t] = max_recs * sizeof(FinalItem);
         thread_bufs[t] = (TempItem *)mmap(NULL, thread_buf_bytes[t], PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
     }
 
     std::vector<std::thread> workers;
 
     for (unsigned int t = 0; t < num_threads; t++) {
-        workers.emplace_back([t, &thread_bufs, &thread_partitioned, &thread_buf_bytes, &thread_final_bytes,
-                              &thread_recs, &thread_hour_counts, &thread_hour_offsets, &chunk_starts, &chunk_ends]() {
+        workers.emplace_back([t, &thread_bufs, &thread_recs, &thread_hour_counts, &chunk_starts, &chunk_ends]() {
             const uint8_t *p = chunk_starts[t];
             const uint8_t *end = chunk_ends[t];
             TempItem *wptr = thread_bufs[t];
@@ -268,28 +265,6 @@ int main(int argc, char **argv) {
             }
             size_t n = wptr - thread_bufs[t];
             thread_recs[t] = n;
-
-            // Local counting sort into thread_partitioned
-            FinalItem *part = (FinalItem *)mmap(NULL, thread_final_bytes[t], PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
-            thread_partitioned[t] = part;
-
-            auto &h_offsets = thread_hour_offsets[t];
-            for (int hr = 0; hr < 72; hr++) {
-                h_offsets[hr + 1] = h_offsets[hr] + h_counts[hr];
-            }
-            uint32_t cur[72];
-            memcpy(cur, h_offsets.data(), sizeof(cur));
-
-            const TempItem *src = thread_bufs[t];
-            for (size_t i = 0; i < n; i++) {
-                uint8_t hr = src[i].hour_idx;
-                uint32_t pos = cur[hr]++;
-                part[pos] = {src[i].lat, src[i].ep_code};
-            }
-
-            // Immediately munmap thread_bufs[t]!
-            munmap(thread_bufs[t], thread_buf_bytes[t]);
-            thread_bufs[t] = nullptr;
         });
     }
     for (auto &w : workers) w.join();
@@ -297,6 +272,33 @@ int main(int argc, char **argv) {
 
     munmap((void *)data, file_size);
     close(fd);
+
+    // SERIALIZED copy: only 1 thread allocates FinalItem while TempItem is alive, then munmaps TempItem!
+    for (unsigned int t = 0; t < num_threads; t++) {
+        size_t n = thread_recs[t];
+        thread_final_bytes[t] = n * sizeof(FinalItem);
+        FinalItem *part = (FinalItem *)mmap(NULL, thread_final_bytes[t], PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+        thread_partitioned[t] = part;
+
+        auto &h_offsets = thread_hour_offsets[t];
+        auto &h_counts = thread_hour_counts[t];
+        for (int hr = 0; hr < 72; hr++) {
+            h_offsets[hr + 1] = h_offsets[hr] + h_counts[hr];
+        }
+        uint32_t cur[72];
+        memcpy(cur, h_offsets.data(), sizeof(cur));
+
+        const TempItem *src = thread_bufs[t];
+        for (size_t i = 0; i < n; i++) {
+            uint8_t hr = src[i].hour_idx;
+            uint32_t pos = cur[hr]++;
+            part[pos] = {src[i].lat, src[i].ep_code};
+        }
+
+        // Munmap thread_bufs[t] IMMEDIATELY before next thread allocates!
+        munmap(thread_bufs[t], thread_buf_bytes[t]);
+        thread_bufs[t] = nullptr;
+    }
 
     // Sort endpoints
     std::vector<uint16_t> sorted_endpoint_ids(g_num_endpoints);
@@ -325,7 +327,6 @@ int main(int argc, char **argv) {
 
             int h;
             while ((h = next_hour.fetch_add(1)) < 72) {
-                // Find total count for this hour across all threads
                 uint32_t h_count = 0;
                 for (unsigned int thr = 0; thr < num_threads; thr++) {
                     h_count += thread_hour_counts[thr][h];
