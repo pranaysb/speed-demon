@@ -33,6 +33,7 @@ public:
     QuadHeap() { data.resize(16384); }
     inline bool empty() const { return sz == 0; }
     inline void clear() { sz = 0; }
+    inline uint64_t top_dist() const { return data[0].dist; }
 
     inline void push(uint64_t dist, uint32_t u) {
         if (__builtin_expect(sz >= data.size(), 0)) data.resize(data.size() * 2);
@@ -69,6 +70,60 @@ public:
             data[idx] = last;
         }
         return top;
+    }
+};
+
+// Compact L2-resident open-addressing distance table (131,072 slots = 2MB)
+struct DistMap {
+    static constexpr size_t CAP = 131072;
+    static constexpr size_t MASK = CAP - 1;
+    static constexpr uint32_t EMPTY = 0xFFFFFFFF;
+
+    struct Entry {
+        uint32_t node;
+        uint64_t dist;
+    };
+    Entry *table;
+    std::vector<uint32_t> touched;
+
+    DistMap() {
+        table = (Entry *)malloc(CAP * sizeof(Entry));
+        for (size_t i = 0; i < CAP; i++) table[i].node = EMPTY;
+        touched.reserve(16384);
+    }
+    ~DistMap() { free(table); }
+
+    inline void clear() {
+        for (uint32_t slot : touched) table[slot].node = EMPTY;
+        touched.clear();
+    }
+
+    // Returns dist or UINT64_MAX if not found
+    inline uint64_t get(uint32_t u) const {
+        size_t idx = (u * 2654435761ULL) & MASK;
+        while (table[idx].node != EMPTY) {
+            if (table[idx].node == u) return table[idx].dist;
+            idx = (idx + 1) & MASK;
+        }
+        return UINT64_MAX;
+    }
+
+    // Inserts or updates. Returns true if updated/inserted with smaller dist
+    inline bool update(uint32_t u, uint64_t d) {
+        size_t idx = (u * 2654435761ULL) & MASK;
+        while (table[idx].node != EMPTY) {
+            if (table[idx].node == u) {
+                if (d < table[idx].dist) {
+                    table[idx].dist = d;
+                    return true;
+                }
+                return false;
+            }
+            idx = (idx + 1) & MASK;
+        }
+        table[idx] = {u, d};
+        touched.push_back((uint32_t)idx);
+        return true;
     }
 };
 
@@ -128,19 +183,27 @@ int main(int argc, char **argv) {
     const uint8_t *edges_end = g_data + g_size;
 
     std::vector<uint32_t> f_offsets(num_nodes + 1, 0);
+    std::vector<uint32_t> b_offsets(num_nodes + 1, 0);
 
     const uint8_t *ep = edges_start;
     while (ep < edges_end) {
-        uint32_t u;
-        ep = fast_parse_u32(ep, &u);
+        uint32_t u, v;
+        ep = fast_parse_u32(ep, &u); ep++;
+        ep = fast_parse_u32(ep, &v);
         f_offsets[u + 1]++;
+        b_offsets[v + 1]++;
         while (ep < edges_end && *ep != "\n"[0]) ep++;
         if (ep < edges_end) ep++;
     }
-    for (uint32_t i = 0; i < num_nodes; i++) f_offsets[i + 1] += f_offsets[i];
+    for (uint32_t i = 0; i < num_nodes; i++) {
+        f_offsets[i + 1] += f_offsets[i];
+        b_offsets[i + 1] += b_offsets[i];
+    }
 
     std::vector<uint32_t> f_cur = f_offsets;
+    std::vector<uint32_t> b_cur = b_offsets;
     std::vector<Edge> f_edges(num_edges);
+    std::vector<Edge> b_edges(num_edges);
 
     ep = edges_start;
     while (ep < edges_end) {
@@ -151,6 +214,7 @@ int main(int argc, char **argv) {
         if (ep < edges_end && *ep == "\r"[0]) ep++;
         if (ep < edges_end && *ep == "\n"[0]) ep++;
         f_edges[f_cur[u]++] = {v, w};
+        b_edges[b_cur[v]++] = {u, w};
     }
     madvise((void *)g_data, g_size, MADV_DONTNEED);
     munmap((void *)g_data, g_size);
@@ -159,6 +223,33 @@ int main(int argc, char **argv) {
 #endif
     close(g_fd);
     f_cur.clear(); f_cur.shrink_to_fit();
+    b_cur.clear(); b_cur.shrink_to_fit();
+
+    // Fast BFS component labeling (comp array: 1.7 MB)
+    std::vector<uint8_t> comp(num_nodes, 0);
+    std::vector<uint32_t> q(num_nodes);
+    uint8_t current_comp = 0;
+
+    for (uint32_t root = 0; root < num_nodes; root++) {
+        if (comp[root] != 0) continue;
+        current_comp++;
+        size_t head = 0, tail = 0;
+        comp[root] = current_comp;
+        q[tail++] = root;
+
+        while (head < tail) {
+            uint32_t u = q[head++];
+            for (uint32_t e = f_offsets[u], ee = f_offsets[u + 1]; e < ee; e++) {
+                uint32_t v = f_edges[e].target;
+                if (comp[v] == 0) { comp[v] = current_comp; q[tail++] = v; }
+            }
+            for (uint32_t e = b_offsets[u], ee = b_offsets[u + 1]; e < ee; e++) {
+                uint32_t v = b_edges[e].target;
+                if (comp[v] == 0) { comp[v] = current_comp; q[tail++] = v; }
+            }
+        }
+    }
+    q.clear(); q.shrink_to_fit();
 
     // Read queries
     char queries_path[1024];
@@ -191,8 +282,7 @@ int main(int argc, char **argv) {
     size_t num_queries = queries.size();
     std::vector<int64_t> answers(num_queries, -1);
 
-    // Pin to 6 worker threads: balances 12 Falkenstein logical cores while cutting per-thread memory in half!
-    unsigned int num_threads = 6;
+    unsigned int num_threads = std::min(12u, std::max(4u, std::thread::hardware_concurrency()));
     std::vector<std::thread> workers;
     size_t chunk_size = (num_queries + num_threads - 1) / num_threads;
 
@@ -202,55 +292,79 @@ int main(int argc, char **argv) {
         if (start_q >= end_q) continue;
 
         workers.emplace_back([&, start_q, end_q]() {
-            std::vector<uint64_t> dist(num_nodes, 0);
-            std::vector<uint32_t> tag(num_nodes, 0);
-            uint32_t cur_tag = 1;
-            QuadHeap pq;
+            DistMap map_f, map_b;
+            QuadHeap pq_f, pq_b;
 
             for (size_t qid = start_q; qid < end_q; qid++) {
                 uint32_t s = queries[qid].s;
                 uint32_t t = queries[qid].t;
                 if (s >= num_nodes || t >= num_nodes) { answers[qid] = -1; continue; }
                 if (s == t) { answers[qid] = 0; continue; }
-                if (f_offsets[s + 1] == f_offsets[s]) { answers[qid] = -1; continue; }
 
-                cur_tag++;
-                if (cur_tag == 0) {
-                    std::fill(tag.begin(), tag.end(), 0);
-                    cur_tag = 1;
+                // O(1) unreachable pruning
+                if (f_offsets[s + 1] == f_offsets[s] || b_offsets[t + 1] == b_offsets[t] || comp[s] != comp[t]) {
+                    answers[qid] = -1;
+                    continue;
                 }
 
-                dist[s] = 1;
-                tag[s] = cur_tag;
-                pq.push(0, s);
+                map_f.update(s, 0); pq_f.push(0, s);
+                map_b.update(t, 0); pq_b.push(0, t);
 
-                int64_t ans = -1;
+                uint64_t best_dist = UINT64_MAX;
 
-                while (!pq.empty()) {
-                    HeapItem item = pq.pop();
-                    uint64_t d = item.dist;
-                    uint32_t u = item.u;
+                while (!pq_f.empty() && !pq_b.empty()) {
+                    if (pq_f.top_dist() + pq_b.top_dist() >= best_dist) break;
 
-                    if (tag[u] == cur_tag && d + 1 > dist[u]) continue;
-                    if (u == t) {
-                        ans = d;
-                        break;
-                    }
+                    if (pq_f.top_dist() <= pq_b.top_dist()) {
+                        HeapItem item = pq_f.pop();
+                        uint64_t d = item.dist;
+                        uint32_t u = item.u;
+                        if (d > map_f.get(u)) continue;
 
-                    uint32_t es = f_offsets[u], ee = f_offsets[u + 1];
-                    for (uint32_t e = es; e < ee; e++) {
-                        uint32_t v = f_edges[e].target;
-                        uint64_t nd = d + f_edges[e].weight;
-                        if (tag[v] != cur_tag || nd + 1 < dist[v]) {
-                            tag[v] = cur_tag;
-                            dist[v] = nd + 1;
-                            pq.push(nd, v);
+                        uint32_t es = f_offsets[u], ee = f_offsets[u + 1];
+                        for (uint32_t e = es; e < ee; e++) {
+                            uint32_t v = f_edges[e].target;
+                            uint64_t nd = d + f_edges[e].weight;
+                            if (nd >= best_dist) continue;
+
+                            if (map_f.update(v, nd)) {
+                                pq_f.push(nd, v);
+                                uint64_t bd = map_b.get(v);
+                                if (bd != UINT64_MAX) {
+                                    uint64_t cand = nd + bd;
+                                    if (cand < best_dist) best_dist = cand;
+                                }
+                            }
+                        }
+                    } else {
+                        HeapItem item = pq_b.pop();
+                        uint64_t d = item.dist;
+                        uint32_t u = item.u;
+                        if (d > map_b.get(u)) continue;
+
+                        uint32_t es = b_offsets[u], ee = b_offsets[u + 1];
+                        for (uint32_t e = es; e < ee; e++) {
+                            uint32_t v = b_edges[e].target;
+                            uint64_t nd = d + b_edges[e].weight;
+                            if (nd >= best_dist) continue;
+
+                            if (map_b.update(v, nd)) {
+                                pq_b.push(nd, v);
+                                uint64_t fd = map_f.get(v);
+                                if (fd != UINT64_MAX) {
+                                    uint64_t cand = nd + fd;
+                                    if (cand < best_dist) best_dist = cand;
+                                }
+                            }
                         }
                     }
                 }
 
-                answers[qid] = ans;
-                pq.clear();
+                answers[qid] = (best_dist == UINT64_MAX) ? -1 : (int64_t)best_dist;
+                map_f.clear();
+                map_b.clear();
+                pq_f.clear();
+                pq_b.clear();
             }
         });
     }
@@ -273,6 +387,6 @@ int main(int argc, char **argv) {
     free(out_buf);
 
     double ms = std::chrono::duration<double, std::milli>(std::chrono::high_resolution_clock::now() - t_start).count();
-    printf("Track D Compact Total Time: %.2f ms\n", ms);
+    printf("Track D DistMap Total Time: %.2f ms\n", ms);
     return 0;
 }

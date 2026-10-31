@@ -334,6 +334,7 @@ int main(int argc, char **argv) {
     fstat(d_fd, &st);
     size_t d_size = st.st_size;
     const uint8_t *d_data = (const uint8_t *)mmap(NULL, d_size, PROT_READ, MAP_SHARED, d_fd, 0);
+    madvise((void *)d_data, d_size, MADV_SEQUENTIAL);
 
     unsigned int num_threads = std::thread::hardware_concurrency();
     if (num_threads == 0) num_threads = 4;
@@ -529,6 +530,7 @@ int main(int argc, char **argv) {
     for (auto &w : workers) w.join();
     workers.clear();
     thread_write_ptrs.clear();
+    madvise((void *)d_data, d_size, MADV_DONTNEED);
 
     // 3. Answer queries
     struct ThreadOutBuf {
