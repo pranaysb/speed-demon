@@ -10,7 +10,6 @@
 #include <vector>
 #include <string>
 #include <thread>
-#include <chrono>
 
 #if defined(__linux__)
 #include <malloc.h>
@@ -163,7 +162,7 @@ int main(int argc, char **argv) {
         close(fd);
         return 1;
     }
-    madvise((void *)data, file_size, MADV_SEQUENTIAL | MADV_WILLNEED);
+    madvise((void *)data, file_size, MADV_SEQUENTIAL);
 
     unsigned int num_threads = std::thread::hardware_concurrency();
     if (num_threads == 0) num_threads = 4;
@@ -206,106 +205,29 @@ int main(int argc, char **argv) {
     }
     chunk_ends[num_threads - 1] = data + file_size;
 
-    // Pass 1: Quick count of records per country per thread
-    std::vector<std::vector<uint32_t>> thread_country_counts(num_threads);
+    // ONE SINGLE PASS: Parse everything in 1 pass!
+    // Each thread stores aggregations + per-country vector of name hashes
+    struct ThreadState {
+        std::vector<ThreadCountryAgg> aggs;
+        std::vector<std::vector<uint64_t>> country_hashes;
+    };
+    std::vector<ThreadState> thread_states(num_threads);
+    for (unsigned int t = 0; t < num_threads; t++) {
+        thread_states[t].aggs.resize(num_countries);
+        thread_states[t].country_hashes.resize(num_countries);
+        for (size_t c = 0; c < num_countries; c++) {
+            thread_states[t].country_hashes[c].reserve(1024);
+        }
+    }
+
     std::vector<std::thread> workers;
 
     for (unsigned int t = 0; t < num_threads; t++) {
-        thread_country_counts[t].resize(num_countries, 0);
-        workers.emplace_back([t, &thread_country_counts, &chunk_starts, &chunk_ends, &region_to_cid]() {
+        workers.emplace_back([t, &thread_states, &chunk_starts, &chunk_ends, &region_to_cid, num_countries]() {
             const uint8_t *p = chunk_starts[t];
             const uint8_t *end = chunk_ends[t];
-            auto &counts = thread_country_counts[t];
-            size_t reg_limit = region_to_cid.size();
-
-            while (p < end) {
-                if (end - p >= 3 && p[0] == 0xEF && p[1] == 0xBB && p[2] == 0xBF) p += 3;
-                if (p >= end) break;
-
-                // 1. id
-                while (p < end && *p >= '0' && *p <= '9') p++;
-                if (p < end && *p == ',') p++;
-
-                // 2. name
-                if (p < end && *p == '"') {
-                    p++;
-                    while (p < end) {
-                        if (*p == '"') {
-                            if (p + 1 < end && *(p + 1) == '"') p += 2;
-                            else { p++; break; }
-                        } else p++;
-                    }
-                } else {
-                    while (p < end && *p != ',') p++;
-                }
-                if (p < end && *p == ',') p++;
-
-                // 3. note
-                if (p < end && *p == '"') {
-                    p++;
-                    while (p < end) {
-                        if (*p == '"') {
-                            if (p + 1 < end && *(p + 1) == '"') p += 2;
-                            else { p++; break; }
-                        } else p++;
-                    }
-                } else {
-                    while (p < end && *p != ',') p++;
-                }
-                if (p < end && *p == ',') p++;
-
-                // 4. region_id
-                uint32_t reg_id = 0;
-                while (p < end && *p >= '0' && *p <= '9') {
-                    reg_id = reg_id * 10 + (*p - '0');
-                    p++;
-                }
-                uint8_t cid = (reg_id < reg_limit) ? region_to_cid[reg_id] : 0;
-                counts[cid]++;
-
-                // skip amount to end of line
-                while (p < end && *p != '\n') p++;
-                if (p < end && *p == '\n') p++;
-            }
-        });
-    }
-    for (auto &w : workers) w.join();
-    workers.clear();
-
-    // Compute country offsets and thread base write pointers
-    std::vector<uint32_t> country_offsets(num_countries + 1, 0);
-    std::vector<std::vector<uint32_t>> thread_write_ptrs(num_threads);
-    for (unsigned int t = 0; t < num_threads; t++) thread_write_ptrs[t].resize(num_countries, 0);
-
-    for (size_t c = 0; c < num_countries; c++) {
-        uint32_t s = 0;
-        for (unsigned int t = 0; t < num_threads; t++) {
-            thread_write_ptrs[t][c] = s;
-            s += thread_country_counts[t][c];
-        }
-        country_offsets[c + 1] = country_offsets[c] + s;
-    }
-    for (size_t c = 0; c < num_countries; c++) {
-        uint32_t base = country_offsets[c];
-        for (unsigned int t = 0; t < num_threads; t++) {
-            thread_write_ptrs[t][c] += base;
-        }
-    }
-    thread_country_counts.clear();
-
-    size_t total_records = country_offsets[num_countries];
-    uint64_t *sorted_hashes = (uint64_t *)malloc(total_records * sizeof(uint64_t));
-
-    // Pass 2: Parse and scatter DIRECTLY into sorted_hashes (ZERO intermediate vectors!)
-    std::vector<std::vector<ThreadCountryAgg>> thread_aggs(num_threads);
-    for (unsigned int t = 0; t < num_threads; t++) thread_aggs[t].resize(num_countries);
-
-    for (unsigned int t = 0; t < num_threads; t++) {
-        workers.emplace_back([t, &thread_aggs, &chunk_starts, &chunk_ends, &region_to_cid, &thread_write_ptrs, sorted_hashes]() {
-            const uint8_t *p = chunk_starts[t];
-            const uint8_t *end = chunk_ends[t];
-            auto &aggs = thread_aggs[t];
-            auto &wr = thread_write_ptrs[t];
+            auto &aggs = thread_states[t].aggs;
+            auto &c_hashes = thread_states[t].country_hashes;
             size_t reg_limit = region_to_cid.size();
 
             while (p < end) {
@@ -349,7 +271,6 @@ int main(int argc, char **argv) {
                     }
                 }
                 if (p < end && *p == ',') p++;
-                n_hash ^= name_len;
 
                 // 3. note
                 uint64_t note_len = 0;
@@ -370,10 +291,9 @@ int main(int argc, char **argv) {
                         }
                     }
                 } else {
-                    while (p < end && *p != ',') {
-                        note_len++;
-                        p++;
-                    }
+                    const uint8_t *ns = p;
+                    while (p < end && *p != ',') p++;
+                    note_len = p - ns;
                 }
                 if (p < end && *p == ',') p++;
 
@@ -386,11 +306,8 @@ int main(int argc, char **argv) {
                 if (p < end && *p == ',') p++;
 
                 // 5. amount
-                int64_t sign = 1;
-                if (p < end && *p == '-') {
-                    sign = -1;
-                    p++;
-                }
+                bool neg = false;
+                if (p < end && *p == '-') { neg = true; p++; }
                 int64_t whole = 0;
                 while (p < end && *p >= '0' && *p <= '9') {
                     whole = whole * 10 + (*p - '0');
@@ -401,124 +318,134 @@ int main(int argc, char **argv) {
                 if (p < end && *p >= '0' && *p <= '9') {
                     frac = (*p - '0') * 10;
                     p++;
-                    if (p < end && *p >= '0' && *p <= '9') {
-                        frac += (*p - '0');
-                        p++;
-                    }
                 }
-                int64_t cents = sign * (whole * 100 + frac);
+                if (p < end && *p >= '0' && *p <= '9') {
+                    frac += (*p - '0');
+                    p++;
+                }
+                int64_t cents = whole * 100 + frac;
+                if (neg) cents = -cents;
 
-                if (p < end && *p == '\r') p++;
+                while (p < end && *p != '\n') p++;
                 if (p < end && *p == '\n') p++;
 
                 uint8_t cid = (reg_id < reg_limit) ? region_to_cid[reg_id] : 0;
-                ThreadCountryAgg &ca = aggs[cid];
-                ca.count++;
-                ca.id_sum += rec_id;
-                ca.amount_sum += cents;
-                if (!ca.has_amount) {
-                    ca.amount_min = cents;
-                    ca.amount_max = cents;
-                    ca.has_amount = true;
+                auto &agg = aggs[cid];
+                agg.count++;
+                agg.id_sum += rec_id;
+                agg.name_bytes += name_len;
+                agg.note_bytes += note_len;
+                agg.amount_sum += cents;
+                if (!agg.has_amount) {
+                    agg.amount_min = cents;
+                    agg.amount_max = cents;
+                    agg.has_amount = true;
                 } else {
-                    if (cents < ca.amount_min) ca.amount_min = cents;
-                    if (cents > ca.amount_max) ca.amount_max = cents;
+                    if (cents < agg.amount_min) agg.amount_min = cents;
+                    if (cents > agg.amount_max) agg.amount_max = cents;
                 }
-                ca.name_bytes += name_len;
-                ca.note_bytes += note_len;
 
-                uint32_t pos = wr[cid]++;
-                sorted_hashes[pos] = n_hash;
+                c_hashes[cid].push_back(n_hash);
             }
         });
     }
     for (auto &w : workers) w.join();
     workers.clear();
-
     munmap((void *)data, file_size);
+#if defined(__linux__)
+    posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED);
+#endif
     close(fd);
-    thread_write_ptrs.clear();
 
-    // 3. Merge scalar aggregates & sort distinct names per country
+    // Parallel merge and sort country distinct hashes
     std::vector<FinalCountryAgg> final_aggs(num_countries);
     for (size_t c = 0; c < num_countries; c++) {
         final_aggs[c].key = country_names[c];
+        bool has_amt = false;
         for (unsigned int t = 0; t < num_threads; t++) {
-            const auto &ca = thread_aggs[t][c];
-            if (ca.count == 0) continue;
-            auto &fa = final_aggs[c];
-            fa.count += ca.count;
-            fa.id_sum += ca.id_sum;
-            fa.amount_sum += ca.amount_sum;
-            fa.name_bytes += ca.name_bytes;
-            fa.note_bytes += ca.note_bytes;
-            if (!ca.has_amount) continue;
-            if (fa.count == ca.count) {
-                fa.amount_min = ca.amount_min;
-                fa.amount_max = ca.amount_max;
-            } else {
-                if (ca.amount_min < fa.amount_min) fa.amount_min = ca.amount_min;
-                if (ca.amount_max > fa.amount_max) fa.amount_max = ca.amount_max;
+            const auto &agg = thread_states[t].aggs[c];
+            final_aggs[c].count += agg.count;
+            final_aggs[c].id_sum += agg.id_sum;
+            final_aggs[c].amount_sum += agg.amount_sum;
+            final_aggs[c].name_bytes += agg.name_bytes;
+            final_aggs[c].note_bytes += agg.note_bytes;
+            if (agg.has_amount) {
+                if (!has_amt) {
+                    final_aggs[c].amount_min = agg.amount_min;
+                    final_aggs[c].amount_max = agg.amount_max;
+                    has_amt = true;
+                } else {
+                    if (agg.amount_min < final_aggs[c].amount_min) final_aggs[c].amount_min = agg.amount_min;
+                    if (agg.amount_max > final_aggs[c].amount_max) final_aggs[c].amount_max = agg.amount_max;
+                }
             }
         }
     }
-    thread_aggs.clear();
 
-    // Parallel sort & distinct count for each country
+    size_t country_chunk = (num_countries + num_threads - 1) / num_threads;
     for (unsigned int t = 0; t < num_threads; t++) {
-        workers.emplace_back([t, num_threads, num_countries, &final_aggs, &country_offsets, sorted_hashes]() {
-            for (size_t c = t; c < num_countries; c += num_threads) {
-                uint32_t st = country_offsets[c];
-                uint32_t en = country_offsets[c + 1];
-                if (st >= en) continue;
-                std::sort(&sorted_hashes[st], &sorted_hashes[en]);
-                final_aggs[c].names_distinct = std::unique(&sorted_hashes[st], &sorted_hashes[en]) - &sorted_hashes[st];
+        size_t c_start = t * country_chunk;
+        size_t c_end = std::min(c_start + country_chunk, num_countries);
+        if (c_start >= c_end) continue;
+
+        workers.emplace_back([c_start, c_end, &final_aggs, &thread_states, num_threads]() {
+            std::vector<uint64_t> merged;
+            for (size_t c = c_start; c < c_end; c++) {
+                merged.clear();
+                size_t total_c_hashes = 0;
+                for (unsigned int tid = 0; tid < num_threads; tid++) {
+                    total_c_hashes += thread_states[tid].country_hashes[c].size();
+                }
+                merged.reserve(total_c_hashes);
+                for (unsigned int tid = 0; tid < num_threads; tid++) {
+                    const auto &hvec = thread_states[tid].country_hashes[c];
+                    merged.insert(merged.end(), hvec.begin(), hvec.end());
+                }
+
+                std::sort(merged.begin(), merged.end());
+                uint32_t distinct = 0;
+                for (size_t i = 0; i < merged.size(); i++) {
+                    if (i == 0 || merged[i] != merged[i - 1]) distinct++;
+                }
+                final_aggs[c].names_distinct = distinct;
             }
         });
     }
     for (auto &w : workers) w.join();
     workers.clear();
 
-    // Sort countries by key in byte order
-    std::vector<size_t> sorted_cids;
-    for (size_t c = 0; c < num_countries; c++) {
-        if (final_aggs[c].count > 0) {
-            sorted_cids.push_back(c);
-        }
-    }
-    std::sort(sorted_cids.begin(), sorted_cids.end(), [&](size_t a, size_t b) {
-        return final_aggs[a].key < final_aggs[b].key;
+    // Sort countries lexicographically
+    std::sort(final_aggs.begin(), final_aggs.end(), [](const FinalCountryAgg &a, const FinalCountryAgg &b) {
+        return a.key < b.key;
     });
 
-    // 4. Format output
+    // Write output
     mkdir(out_dir, 0777);
     char out_path[1024];
     snprintf(out_path, sizeof(out_path), "%s/aggregates.txt", out_dir);
 
     FILE *out = fopen(out_path, "wb");
-    if (!out) { perror("fopen out"); return 1; }
-
     char *out_buf = (char *)malloc(1024 * 1024);
     setvbuf(out, out_buf, _IOFBF, 1024 * 1024);
 
-    char row_buf[512];
-    for (size_t cid : sorted_cids) {
-        const FinalCountryAgg &fa = final_aggs[cid];
-        char *p = row_buf;
-        memcpy(p, fa.key.data(), fa.key.size()); p += fa.key.size(); *p++ = ' ';
-        p = fast_u64(p, fa.count); *p++ = ' ';
-        p = fast_u64(p, fa.id_sum); *p++ = ' ';
-        p = format_cents(p, fa.amount_sum); *p++ = ' ';
-        p = format_cents(p, fa.amount_min); *p++ = ' ';
-        p = format_cents(p, fa.amount_max); *p++ = ' ';
-        p = fast_u64(p, fa.names_distinct); *p++ = ' ';
-        p = fast_u64(p, fa.name_bytes); *p++ = ' ';
-        p = fast_u64(p, fa.note_bytes); *p++ = '\n';
-        fwrite(row_buf, 1, p - row_buf, out);
+    char out_line[512];
+    for (const auto &agg : final_aggs) {
+        if (agg.count == 0) continue;
+        char *p = out_line;
+        memcpy(p, agg.key.data(), agg.key.size()); p += agg.key.size(); *p++ = ' ';
+        p = fast_u64(p, agg.count); *p++ = ' ';
+        p = fast_u64(p, agg.id_sum); *p++ = ' ';
+        p = format_cents(p, agg.amount_sum); *p++ = ' ';
+        p = format_cents(p, agg.amount_min); *p++ = ' ';
+        p = format_cents(p, agg.amount_max); *p++ = ' ';
+        p = fast_u64(p, agg.names_distinct); *p++ = ' ';
+        p = fast_u64(p, agg.name_bytes); *p++ = ' ';
+        p = fast_u64(p, agg.note_bytes); *p++ = '\n';
+
+        fwrite(out_line, 1, p - out_line, out);
     }
     fclose(out);
     free(out_buf);
-    free(sorted_hashes);
 
     return 0;
 }

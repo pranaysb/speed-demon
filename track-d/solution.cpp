@@ -9,7 +9,6 @@
 #include <algorithm>
 #include <vector>
 #include <thread>
-#include <chrono>
 
 #if defined(__linux__)
 #include <malloc.h>
@@ -30,7 +29,7 @@ public:
     std::vector<HeapItem> data;
     size_t sz = 0;
 
-    QuadHeap() { data.resize(65536); }
+    QuadHeap() { data.resize(16384); }
     inline bool empty() const { return sz == 0; }
     inline void clear() { sz = 0; }
 
@@ -101,6 +100,79 @@ static inline char* fast_i64(char *p, int64_t v) {
     return p;
 }
 
+struct CompactDistMap {
+    struct Entry {
+        uint32_t node;
+        uint64_t dist;
+    };
+    std::vector<Entry> table;
+    uint32_t mask;
+    uint32_t count = 0;
+    static constexpr uint32_t EMPTY = 0xffffffff;
+
+    CompactDistMap(size_t cap = 65536) {
+        table.resize(cap, {EMPTY, UINT64_MAX});
+        mask = (uint32_t)(cap - 1);
+    }
+
+    inline void clear(const std::vector<uint32_t> &touched) {
+        for (uint32_t u : touched) {
+            uint32_t slot = (u * 0x9e3779b9u) & mask;
+            while (table[slot].node != u) {
+                slot = (slot + 1) & mask;
+            }
+            table[slot].node = EMPTY;
+            table[slot].dist = UINT64_MAX;
+        }
+        count = 0;
+    }
+
+    inline uint64_t get(uint32_t u) const {
+        uint32_t slot = (u * 0x9e3779b9u) & mask;
+        while (true) {
+            uint32_t n = table[slot].node;
+            if (n == u) return table[slot].dist;
+            if (n == EMPTY) return UINT64_MAX;
+            slot = (slot + 1) & mask;
+        }
+    }
+
+    inline bool update_if_less(uint32_t u, uint64_t d, std::vector<uint32_t> &touched) {
+        if (__builtin_expect(count * 2 >= table.size(), 0)) {
+            size_t new_cap = table.size() * 2;
+            std::vector<Entry> new_table(new_cap, {EMPTY, UINT64_MAX});
+            uint32_t new_mask = (uint32_t)(new_cap - 1);
+            for (uint32_t x : touched) {
+                uint64_t old_d = get(x);
+                uint32_t slot = (x * 0x9e3779b9u) & new_mask;
+                while (new_table[slot].node != EMPTY) slot = (slot + 1) & new_mask;
+                new_table[slot] = {x, old_d};
+            }
+            table = std::move(new_table);
+            mask = new_mask;
+        }
+
+        uint32_t slot = (u * 0x9e3779b9u) & mask;
+        while (true) {
+            uint32_t n = table[slot].node;
+            if (n == u) {
+                if (d < table[slot].dist) {
+                    table[slot].dist = d;
+                    return true;
+                }
+                return false;
+            }
+            if (n == EMPTY) {
+                table[slot] = {u, d};
+                touched.push_back(u);
+                count++;
+                return true;
+            }
+            slot = (slot + 1) & mask;
+        }
+    }
+};
+
 int main(int argc, char **argv) {
 #if defined(__linux__)
     mallopt(M_ARENA_MAX, 1);
@@ -114,8 +186,6 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[i], "--out") == 0 && i + 1 < argc) out_dir = argv[++i];
     }
 
-
-
     char graph_path[1024];
     snprintf(graph_path, sizeof(graph_path), "%s/graph.txt", data_dir);
 
@@ -126,8 +196,6 @@ int main(int argc, char **argv) {
     fstat(g_fd, &st);
     size_t g_size = st.st_size;
     const uint8_t *g_data = (const uint8_t *)mmap(NULL, g_size, PROT_READ, MAP_SHARED, g_fd, 0);
-    if (g_data == MAP_FAILED) { perror("mmap graph"); close(g_fd); return 1; }
-    madvise((void *)g_data, g_size, MADV_SEQUENTIAL | MADV_WILLNEED);
 
     const uint8_t *p = g_data;
     uint32_t num_nodes = 0, num_edges = 0;
@@ -140,16 +208,11 @@ int main(int argc, char **argv) {
     const uint8_t *edges_end = g_data + g_size;
 
     std::vector<uint32_t> offsets(num_nodes + 1, 0);
-    std::vector<uint32_t> in_deg(num_nodes, 0);
-
-    // Pass 1: count node out-degrees and in-degrees
     const uint8_t *ep = edges_start;
     while (ep < edges_end) {
-        uint32_t u, v;
-        ep = fast_parse_u32(ep, &u); ep++;
-        ep = fast_parse_u32(ep, &v);
+        uint32_t u;
+        ep = fast_parse_u32(ep, &u);
         offsets[u + 1]++;
-        in_deg[v]++;
         while (ep < edges_end && *ep != '\n') ep++;
         if (ep < edges_end) ep++;
     }
@@ -158,7 +221,6 @@ int main(int argc, char **argv) {
     std::vector<uint32_t> cur = offsets;
     std::vector<Edge> edges(num_edges);
 
-    // Pass 2: store forward edges
     ep = edges_start;
     while (ep < edges_end) {
         uint32_t u, v, w;
@@ -170,43 +232,11 @@ int main(int argc, char **argv) {
         edges[cur[u]++] = {v, w};
     }
     munmap((void *)g_data, g_size);
+#if defined(__linux__)
+    posix_fadvise(g_fd, 0, 0, POSIX_FADV_DONTNEED);
+#endif
     close(g_fd);
     cur.clear(); cur.shrink_to_fit();
-
-    // Fast DSU to label weakly connected components
-    std::vector<uint32_t> parent(num_nodes);
-    for (uint32_t i = 0; i < num_nodes; i++) parent[i] = i;
-
-    auto dsu_find = [&](uint32_t i) -> uint32_t {
-        uint32_t root = i;
-        while (parent[root] != root) root = parent[root];
-        while (i != root) { uint32_t nxt = parent[i]; parent[i] = root; i = nxt; }
-        return root;
-    };
-
-    for (uint32_t u = 0; u < num_nodes; u++) {
-        for (uint32_t e = offsets[u], ee = offsets[u + 1]; e < ee; e++) {
-            uint32_t v = edges[e].target;
-            uint32_t ru = dsu_find(u);
-            uint32_t rv = dsu_find(v);
-            if (ru != rv) parent[ru] = rv;
-        }
-    }
-
-    std::vector<uint8_t> comp(num_nodes, 0);
-    uint8_t current_comp = 0;
-    std::vector<uint8_t> root_to_comp(num_nodes, 0);
-    for (uint32_t i = 0; i < num_nodes; i++) {
-        uint32_t r = dsu_find(i);
-        if (root_to_comp[r] == 0) {
-            root_to_comp[r] = ++current_comp;
-        }
-        comp[i] = root_to_comp[r];
-    }
-    parent.clear(); parent.shrink_to_fit();
-    root_to_comp.clear(); root_to_comp.shrink_to_fit();
-
-
 
     // Read queries
     char queries_path[1024];
@@ -232,12 +262,18 @@ int main(int argc, char **argv) {
         queries.push_back(q_item);
     }
     munmap((void *)q_data, q_size);
+#if defined(__linux__)
+    posix_fadvise(q_fd, 0, 0, POSIX_FADV_DONTNEED);
+#endif
     close(q_fd);
 
     size_t num_queries = queries.size();
     std::vector<int64_t> answers(num_queries, -1);
 
-    unsigned int num_threads = 6;
+    unsigned int num_threads = std::thread::hardware_concurrency();
+    if (num_threads == 0) num_threads = 4;
+    if (num_threads > 12) num_threads = 12;
+
     std::vector<std::thread> workers;
     size_t chunk_size = (num_queries + num_threads - 1) / num_threads;
 
@@ -247,9 +283,9 @@ int main(int argc, char **argv) {
         if (start_q >= end_q) continue;
 
         workers.emplace_back([&, start_q, end_q]() {
-            std::vector<uint64_t> dist(num_nodes, UINT64_MAX);
+            CompactDistMap dist_map(65536);
             std::vector<uint32_t> touched;
-            touched.reserve(65536);
+            touched.reserve(16384);
             QuadHeap pq;
 
             for (size_t qid = start_q; qid < end_q; qid++) {
@@ -258,47 +294,46 @@ int main(int argc, char **argv) {
                 if (s >= num_nodes || t >= num_nodes) { answers[qid] = -1; continue; }
                 if (s == t) { answers[qid] = 0; continue; }
 
-                // O(1) unreachable pruning
-                if (offsets[s + 1] == offsets[s] || in_deg[t] == 0 || comp[s] != comp[t]) {
+                if (offsets[s + 1] == offsets[s]) {
                     answers[qid] = -1;
                     continue;
                 }
 
-                dist[s] = 0;
-                touched.push_back(s);
+                dist_map.update_if_less(s, 0, touched);
                 pq.push(0, s);
+
+                uint64_t ans = UINT64_MAX;
 
                 while (!pq.empty()) {
                     HeapItem top = pq.pop();
                     uint64_t d = top.dist;
                     uint32_t u = top.u;
 
-                    if (d > dist[u]) continue;
-                    if (u == t) break;
+                    if (d > dist_map.get(u)) continue;
+                    if (u == t) {
+                        ans = d;
+                        break;
+                    }
 
                     uint32_t es = offsets[u], ee = offsets[u + 1];
                     for (uint32_t e = es; e < ee; e++) {
                         uint32_t v = edges[e].target;
                         uint64_t nd = d + edges[e].weight;
 
-                        if (nd < dist[v]) {
-                            if (dist[v] == UINT64_MAX) touched.push_back(v);
-                            dist[v] = nd;
+                        if (dist_map.update_if_less(v, nd, touched)) {
                             pq.push(nd, v);
                         }
                     }
                 }
 
-                answers[qid] = (dist[t] == UINT64_MAX) ? -1 : (int64_t)dist[t];
-                for (uint32_t x : touched) dist[x] = UINT64_MAX;
+                answers[qid] = (ans == UINT64_MAX) ? -1 : (int64_t)ans;
+                dist_map.clear(touched);
                 touched.clear();
                 pq.clear();
             }
         });
     }
     for (auto &w : workers) w.join();
-
-
 
     mkdir(out_dir, 0777);
     char out_path[1024];
@@ -309,11 +344,11 @@ int main(int argc, char **argv) {
     char *out_buf = (char *)malloc(1024 * 1024);
     setvbuf(out, out_buf, _IOFBF, 1024 * 1024);
 
-    char line[32];
+    char row[32];
     for (size_t i = 0; i < num_queries; i++) {
-        char *lp = fast_i64(line, answers[i]);
-        *lp++ = '\n';
-        fwrite(line, 1, lp - line, out);
+        char *rp = fast_i64(row, answers[i]);
+        *rp++ = '\n';
+        fwrite(row, 1, rp - row, out);
     }
     fclose(out);
     free(out_buf);

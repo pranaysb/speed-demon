@@ -282,6 +282,9 @@ int main(int argc, char **argv) {
     workers.clear();
 
     munmap((void *)data, file_size);
+#if defined(__linux__)
+    posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED);
+#endif
     close(fd);
     thread_write_ptrs.clear();
 
