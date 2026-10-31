@@ -471,6 +471,9 @@ int main(int argc, char **argv) {
     for (auto &w : workers) w.join();
     workers.clear();
 
+#if defined(__linux__)
+    posix_fadvise(fd, 0, file_size, POSIX_FADV_DONTNEED);
+#endif
     munmap((void *)data, file_size);
     close(fd);
 
