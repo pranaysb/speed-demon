@@ -103,18 +103,9 @@ static uint16_t get_or_insert_endpoint_with_hash(const char *p, size_t len, uint
 }
 
 #pragma pack(push, 2)
-struct TempItem {
+struct Item6 {
     uint32_t lat;
     uint16_t ep_code; // bit 15: is_err, bits 0..14: ep_id
-    uint8_t hour_idx;
-    uint8_t pad;
-};
-#pragma pack(pop)
-
-#pragma pack(push, 2)
-struct FinalItem {
-    uint32_t lat;
-    uint16_t ep_code;
 };
 #pragma pack(pop)
 
@@ -140,6 +131,13 @@ static inline char* fast_u64(char *p, uint64_t v) {
     while (i > 0) *p++ = buf[--i];
     return p;
 }
+
+// Flat block arena for 6-byte items: 256 items = 1536 bytes per block
+static constexpr size_t BLOCK_CAP = 256;
+struct ItemBlock {
+    Item6 items[BLOCK_CAP];
+    ItemBlock *next;
+};
 
 int main(int argc, char **argv) {
 #if defined(__linux__)
@@ -183,29 +181,32 @@ int main(int argc, char **argv) {
     }
     chunk_ends[num_threads - 1] = data + file_size;
 
-    std::vector<TempItem *> thread_bufs(num_threads);
-    std::vector<FinalItem *> thread_partitioned(num_threads);
-    std::vector<size_t> thread_buf_bytes(num_threads);
-    std::vector<size_t> thread_final_bytes(num_threads);
-    std::vector<size_t> thread_recs(num_threads);
-    std::vector<std::vector<uint32_t>> thread_hour_offsets(num_threads, std::vector<uint32_t>(73, 0));
-    std::vector<std::vector<uint32_t>> thread_hour_counts(num_threads, std::vector<uint32_t>(72, 0));
+    // Allocate flat block arena: ~19MB across all threads
+    size_t blocks_per_thread = (file_size / (num_threads * 65 * BLOCK_CAP)) + 200;
+    size_t arena_bytes = blocks_per_thread * sizeof(ItemBlock);
 
+    std::vector<ItemBlock *> thread_arenas(num_threads);
     for (unsigned int t = 0; t < num_threads; t++) {
-        size_t chunk_bytes = chunk_ends[t] - chunk_starts[t];
-        size_t max_recs = (chunk_bytes / 65) + 5000;
-        thread_buf_bytes[t] = max_recs * sizeof(TempItem);
-        thread_bufs[t] = (TempItem *)mmap(NULL, thread_buf_bytes[t], PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+        thread_arenas[t] = (ItemBlock *)mmap(NULL, arena_bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
     }
 
+    struct ThreadHourHead {
+        ItemBlock *head = nullptr;
+        ItemBlock *tail = nullptr;
+        uint16_t tail_count = 0;
+        uint32_t total_count = 0;
+    };
+
+    std::vector<std::vector<ThreadHourHead>> thread_hours(num_threads, std::vector<ThreadHourHead>(72));
     std::vector<std::thread> workers;
 
     for (unsigned int t = 0; t < num_threads; t++) {
-        workers.emplace_back([t, &thread_bufs, &thread_recs, &thread_hour_counts, &chunk_starts, &chunk_ends]() {
+        workers.emplace_back([t, &thread_arenas, &thread_hours, &chunk_starts, &chunk_ends]() {
             const uint8_t *p = chunk_starts[t];
             const uint8_t *end = chunk_ends[t];
-            TempItem *wptr = thread_bufs[t];
-            auto &h_counts = thread_hour_counts[t];
+            ItemBlock *arena = thread_arenas[t];
+            size_t arena_idx = 0;
+            auto &hours = thread_hours[t];
 
             uint64_t last_hour_prefix = 0;
             int last_hour_idx = -1;
@@ -260,11 +261,18 @@ int main(int argc, char **argv) {
                 if (*p == '\r') p++;
                 if (*p == '\n') p++;
 
-                h_counts[hour_idx]++;
-                *wptr++ = {lat, (uint16_t)(ep_id | is_err), (uint8_t)hour_idx, 0};
+                ThreadHourHead &hh = hours[hour_idx];
+                if (hh.tail_count == BLOCK_CAP || hh.tail == nullptr) {
+                    ItemBlock *new_block = &arena[arena_idx++];
+                    new_block->next = nullptr;
+                    if (!hh.head) hh.head = new_block;
+                    else hh.tail->next = new_block;
+                    hh.tail = new_block;
+                    hh.tail_count = 0;
+                }
+                hh.tail->items[hh.tail_count++] = {lat, (uint16_t)(ep_id | is_err)};
+                hh.total_count++;
             }
-            size_t n = wptr - thread_bufs[t];
-            thread_recs[t] = n;
         });
     }
     for (auto &w : workers) w.join();
@@ -273,37 +281,6 @@ int main(int argc, char **argv) {
     munmap((void *)data, file_size);
     close(fd);
 
-    // Parallel partition across all threads
-    for (unsigned int t = 0; t < num_threads; t++) {
-        workers.emplace_back([t, &thread_recs, &thread_final_bytes, &thread_partitioned,
-                              &thread_hour_offsets, &thread_hour_counts, &thread_bufs, &thread_buf_bytes]() {
-            size_t n = thread_recs[t];
-            thread_final_bytes[t] = n * sizeof(FinalItem);
-            FinalItem *part = (FinalItem *)mmap(NULL, thread_final_bytes[t], PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
-            thread_partitioned[t] = part;
-
-            auto &h_offsets = thread_hour_offsets[t];
-            auto &h_counts = thread_hour_counts[t];
-            for (int hr = 0; hr < 72; hr++) {
-                h_offsets[hr + 1] = h_offsets[hr] + h_counts[hr];
-            }
-            uint32_t cur[72];
-            memcpy(cur, h_offsets.data(), sizeof(cur));
-
-            const TempItem *src = thread_bufs[t];
-            for (size_t i = 0; i < n; i++) {
-                uint8_t hr = src[i].hour_idx;
-                uint32_t pos = cur[hr]++;
-                part[pos] = {src[i].lat, src[i].ep_code};
-            }
-
-            munmap(thread_bufs[t], thread_buf_bytes[t]);
-            thread_bufs[t] = nullptr;
-        });
-    }
-    for (auto &w : workers) w.join();
-    workers.clear();
-
     // Sort endpoints
     std::vector<uint16_t> sorted_endpoint_ids(g_num_endpoints);
     for (size_t i = 0; i < g_num_endpoints; i++) sorted_endpoint_ids[i] = (uint16_t)i;
@@ -311,16 +288,13 @@ int main(int argc, char **argv) {
         return g_endpoint_strings[a] < g_endpoint_strings[b];
     });
 
-    mkdir(out_dir, 0777);
-    char out_path[1024];
-    snprintf(out_path, sizeof(out_path), "%s/summary.txt", out_dir);
-
+    // Format output lines per hour
     std::vector<std::string> hour_outputs(72);
     std::atomic<int> next_hour{0};
 
     for (unsigned int t = 0; t < num_threads; t++) {
         workers.emplace_back([&next_hour, &hour_outputs, &sorted_endpoint_ids,
-                              &thread_partitioned, &thread_hour_offsets, &thread_hour_counts, num_threads]() {
+                              &thread_hours, num_threads]() {
             char line_buf[256];
             uint32_t ep_counts[MAX_ENDPOINTS];
             uint32_t ep_errors[MAX_ENDPOINTS];
@@ -333,22 +307,25 @@ int main(int argc, char **argv) {
             while ((h = next_hour.fetch_add(1)) < 72) {
                 uint32_t h_count = 0;
                 for (unsigned int thr = 0; thr < num_threads; thr++) {
-                    h_count += thread_hour_counts[thr][h];
+                    h_count += thread_hours[thr][h].total_count;
                 }
                 if (h_count == 0) continue;
 
                 memset(ep_counts, 0, sizeof(ep_counts));
                 memset(ep_errors, 0, sizeof(ep_errors));
 
+                // Pass 1 on hour blocks: count per endpoint
                 for (unsigned int thr = 0; thr < num_threads; thr++) {
-                    uint32_t cnt = thread_hour_counts[thr][h];
-                    if (cnt == 0) continue;
-                    uint32_t off = thread_hour_offsets[thr][h];
-                    const FinalItem *items = &thread_partitioned[thr][off];
-                    for (uint32_t i = 0; i < cnt; i++) {
-                        uint16_t ep = items[i].ep_code & 0x7FFF;
-                        ep_counts[ep]++;
-                        if (items[i].ep_code & 0x8000) ep_errors[ep]++;
+                    auto &hh = thread_hours[thr][h];
+                    ItemBlock *blk = hh.head;
+                    while (blk) {
+                        size_t n = (blk == hh.tail) ? hh.tail_count : BLOCK_CAP;
+                        for (size_t i = 0; i < n; i++) {
+                            uint16_t ep = blk->items[i].ep_code & 0x7FFF;
+                            ep_counts[ep]++;
+                            if (blk->items[i].ep_code & 0x8000) ep_errors[ep]++;
+                        }
+                        blk = blk->next;
                     }
                 }
 
@@ -361,15 +338,18 @@ int main(int argc, char **argv) {
                 ep_offsets[MAX_ENDPOINTS] = tot_h;
 
                 sorted_latencies.resize(tot_h);
+                // Scatter latencies into sorted_latencies by endpoint
                 for (unsigned int thr = 0; thr < num_threads; thr++) {
-                    uint32_t cnt = thread_hour_counts[thr][h];
-                    if (cnt == 0) continue;
-                    uint32_t off = thread_hour_offsets[thr][h];
-                    const FinalItem *items = &thread_partitioned[thr][off];
-                    for (uint32_t i = 0; i < cnt; i++) {
-                        uint16_t ep = items[i].ep_code & 0x7FFF;
-                        uint32_t pos = ep_cur[ep]++;
-                        sorted_latencies[pos] = items[i].lat;
+                    auto &hh = thread_hours[thr][h];
+                    ItemBlock *blk = hh.head;
+                    while (blk) {
+                        size_t n = (blk == hh.tail) ? hh.tail_count : BLOCK_CAP;
+                        for (size_t i = 0; i < n; i++) {
+                            uint16_t ep = blk->items[i].ep_code & 0x7FFF;
+                            uint32_t pos = ep_cur[ep]++;
+                            sorted_latencies[pos] = blk->items[i].lat;
+                        }
+                        blk = blk->next;
                     }
                 }
 
@@ -419,6 +399,10 @@ int main(int argc, char **argv) {
     }
     for (auto &w : workers) w.join();
 
+    mkdir(out_dir, 0777);
+    char out_path[1024];
+    snprintf(out_path, sizeof(out_path), "%s/summary.txt", out_dir);
+
     FILE *fout = fopen(out_path, "wb");
     char *out_buf = (char *)malloc(1024 * 1024);
     setvbuf(fout, out_buf, _IOFBF, 1024 * 1024);
@@ -431,7 +415,7 @@ int main(int argc, char **argv) {
     free(out_buf);
 
     for (unsigned int t = 0; t < num_threads; t++) {
-        munmap(thread_partitioned[t], thread_final_bytes[t]);
+        munmap(thread_arenas[t], arena_bytes);
     }
 
     return 0;

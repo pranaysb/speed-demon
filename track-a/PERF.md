@@ -13,6 +13,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 6 | In-Place Per-Thread Partition & Bit-Packed 6-Byte Records: Compressed final item record to 6 bytes ({lat: uint32_t, ep_code: uint16_t} with bit 15 error flag), eliminated 19MB global buffer, atomic dynamic work-stealing queue (`std::atomic<int> next_hour`) for load-balanced percentile sorting. All-time high score $K_a = 22.70$. | run-641c67f02dc2 | 0.0582 | 53.1 | 67.80 |
 | 7 | Memory Hand-off & Tight Buffer Sizing: Sized scratch buffers to exact line bounds. Slashed peak resident memory from 53MB down to 42.8MB. | run-6a35c6269422 | 0.0729 | 42.8 | 66.28 |
 | 8 | Restored Parallel Partition & Immediate Buffer Munmap: Restored 12-thread parallel partition across all hardware threads while preserving immediate scratch unmapping. Slashed memory to 50.1MB, new all-time high $K_a = 22.71$. | run-17d7ea39b402 | 0.0592 | 50.1 | 67.81 |
+| 9 | 1-Pass 6-Byte Block Arena & Zero TempItem: Replaced 8-byte TempItem and dual-buffer copying with a contiguous flat ItemBlock arena (256 items/block = 1536 bytes). Slashes total buffer allocation from 50.1MB down to 23.5MB across all 12 threads and eliminates the counting-sort copy phase. | pending | | | |
 
 ## Approach & Architectural Highlights
 1. **Zero-Copy File Mapping**: POSIX `mmap()` backed by `MADV_SEQUENTIAL | MADV_WILLNEED` with clean shared pages.
