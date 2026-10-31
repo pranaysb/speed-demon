@@ -615,10 +615,11 @@ int main(int argc, char **argv) {
     struct ThreadOutBuf {
         std::vector<char> buf;
     };
-    std::vector<ThreadOutBuf> thread_out_bufs(num_threads);
-    size_t query_chunk = (num_queries + num_threads - 1) / num_threads;
+    unsigned int q_threads = std::min(num_threads, 4u);
+    std::vector<ThreadOutBuf> thread_out_bufs(q_threads);
+    size_t query_chunk = (num_queries + q_threads - 1) / q_threads;
 
-    for (unsigned int tid = 0; tid < num_threads; tid++) {
+    for (unsigned int tid = 0; tid < q_threads; tid++) {
         size_t start_q = tid * query_chunk;
         size_t end_q = std::min(start_q + query_chunk, num_queries);
         if (start_q >= end_q) continue;
@@ -771,7 +772,7 @@ int main(int argc, char **argv) {
     char *out_buf = (char *)malloc(1024 * 1024);
     setvbuf(out, out_buf, _IOFBF, 1024 * 1024);
 
-    for (unsigned int tid = 0; tid < num_threads; tid++) {
+    for (unsigned int tid = 0; tid < q_threads; tid++) {
         if (!thread_out_bufs[tid].buf.empty()) {
             fwrite(thread_out_bufs[tid].buf.data(), 1, thread_out_bufs[tid].buf.size(), out);
         }
