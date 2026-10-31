@@ -305,8 +305,8 @@ int main(int argc, char **argv) {
             const uint8_t *end = chunk_ends[t];
             auto &aggs = thread_aggs[t];
             size_t reg_limit = region_to_cid.size();
-            struct L1NameEntry { uint64_t hash; uint32_t nid; };
-            L1NameEntry l1_names[2048] = {};
+            struct L1NameEntry { uint64_t hash; uint32_t nid; uint16_t last_cid; };
+            L1NameEntry l1_names[4096] = {};
 
             while (p < end) {
                 if (end - p >= 3 && p[0] == 0xEF && p[1] == 0xBB && p[2] == 0xBF) p += 3;
@@ -447,19 +447,23 @@ int main(int argc, char **argv) {
                 ca.note_bytes += note_len;
 
                 // Lookup dense name ID and set in country bitset
-                uint32_t l1_idx = n_hash & 2047;
-                uint32_t nid;
-                if (l1_names[l1_idx].hash == n_hash && l1_names[l1_idx].nid != 0) {
-                    nid = l1_names[l1_idx].nid;
+                uint32_t l1_idx = n_hash & 4095;
+                if (__builtin_expect(l1_names[l1_idx].hash == n_hash && l1_names[l1_idx].last_cid == cid, 1)) {
+                    // Already set in this country bitset
                 } else {
-                    nid = get_or_insert_name_id(n_hash);
-                    l1_names[l1_idx] = {n_hash, nid};
-                }
-                uint32_t word_idx = nid / 64;
-                uint64_t bit_mask = 1ULL << (nid % 64);
-                uint64_t old_val = g_country_bitsets[cid][word_idx].load(std::memory_order_relaxed);
-                if ((old_val & bit_mask) == 0) {
-                    g_country_bitsets[cid][word_idx].fetch_or(bit_mask, std::memory_order_relaxed);
+                    uint32_t nid;
+                    if (l1_names[l1_idx].hash == n_hash && l1_names[l1_idx].nid != 0) {
+                        nid = l1_names[l1_idx].nid;
+                    } else {
+                        nid = get_or_insert_name_id(n_hash);
+                    }
+                    l1_names[l1_idx] = {n_hash, nid, cid};
+                    uint32_t word_idx = nid / 64;
+                    uint64_t bit_mask = 1ULL << (nid % 64);
+                    uint64_t old_val = g_country_bitsets[cid][word_idx].load(std::memory_order_relaxed);
+                    if ((old_val & bit_mask) == 0) {
+                        g_country_bitsets[cid][word_idx].fetch_or(bit_mask, std::memory_order_relaxed);
+                    }
                 }
             }
         });
