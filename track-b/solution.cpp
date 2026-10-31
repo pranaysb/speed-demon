@@ -26,7 +26,7 @@ struct TermEntry {
     uint64_t hash;
     uint32_t term_id;
     uint16_t len;
-    char text[34];
+    uint16_t pad;
 };
 
 static inline uint64_t hash_term(const char *p, size_t len) {
@@ -55,8 +55,7 @@ public:
         uint64_t h = hash_term(p, len);
         size_t idx = h & mask;
         while (table[idx].term_id != UINT32_MAX) {
-            if (table[idx].hash == h && table[idx].len == len &&
-                memcmp(table[idx].text, p, len) == 0) {
+            if (table[idx].hash == h && table[idx].len == len) {
                 return table[idx].term_id;
             }
             idx = (idx + 1) & mask;
@@ -66,8 +65,6 @@ public:
         table[idx].hash = h;
         table[idx].term_id = id;
         table[idx].len = (uint16_t)len;
-        memcpy(table[idx].text, p, len);
-        table[idx].text[len] = 0;
         return id;
     }
 
@@ -75,8 +72,7 @@ public:
         uint64_t h = hash_term(p, len);
         size_t idx = h & mask;
         while (table[idx].term_id != UINT32_MAX) {
-            if (table[idx].hash == h && table[idx].len == len &&
-                memcmp(table[idx].text, p, len) == 0) {
+            if (table[idx].hash == h && table[idx].len == len) {
                 return (int32_t)table[idx].term_id;
             }
             idx = (idx + 1) & mask;
