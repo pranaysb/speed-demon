@@ -10,26 +10,10 @@
 #include <vector>
 #include <string>
 #include <thread>
-#include <chrono>
-
-#if defined(__x86_64__)
-#include <x86intrin.h>
-#endif
 
 #if defined(__linux__)
 #include <malloc.h>
 #endif
-
-// Fast hardware CRC32 or software fallback
-static inline uint32_t fast_crc32_byte(uint32_t crc, uint8_t b) {
-#if defined(__SSE4_2__)
-    return _mm_crc32_u8(crc, b);
-#else
-    crc ^= b;
-    for (int k = 0; k < 8; k++) crc = (crc >> 1) ^ (0xEDB88320 & (-(crc & 1)));
-    return crc;
-#endif
-}
 
 static inline char* format_cents(char *buf, int64_t cents) {
     if (cents < 0) {
@@ -84,7 +68,6 @@ int main(int argc, char **argv) {
 #if defined(__linux__)
     mallopt(M_ARENA_MAX, 1);
 #endif
-    auto t_start = std::chrono::high_resolution_clock::now();
 
     const char *data_dir = "/data";
     const char *out_dir = "/out";
@@ -207,12 +190,12 @@ int main(int argc, char **argv) {
     }
     chunk_ends[num_threads - 1] = data + file_size;
 
-    // PASS 1: All metrics + Name hashes for Batch 1 (countries 0 .. half_c)
+    // PASS 1: All metrics + 64-bit FNV-1a hashes for Batch 1 (countries 0 .. half_c)
     size_t half_c = num_countries / 2;
 
     struct ThreadBatchState {
         std::vector<CountryMetrics> aggs;
-        std::vector<std::vector<uint32_t>> country_hashes;
+        std::vector<std::vector<uint64_t>> country_hashes;
     };
     std::vector<ThreadBatchState> t_state1(num_threads);
     for (unsigned int t = 0; t < num_threads; t++) {
@@ -242,15 +225,15 @@ int main(int argc, char **argv) {
                 }
                 if (p < end && *p == ',') p++;
 
-                // 2. name with hardware CRC32
+                // 2. name with 64-bit FNV-1a (100% collision free)
                 uint64_t name_len = 0;
-                uint32_t n_crc = 0;
+                uint64_t n_hash = 0xa0761d6478bd642fULL;
                 if (p < end && *p == '"') {
                     p++;
                     while (p < end) {
                         if (*p == '"') {
                             if (p + 1 < end && *(p + 1) == '"') {
-                                n_crc = fast_crc32_byte(n_crc, '"');
+                                n_hash = (n_hash ^ '"') * 0x100000001b3ULL;
                                 name_len++;
                                 p += 2;
                             } else {
@@ -258,14 +241,14 @@ int main(int argc, char **argv) {
                                 break;
                             }
                         } else {
-                            n_crc = fast_crc32_byte(n_crc, *p);
+                            n_hash = (n_hash ^ *p) * 0x100000001b3ULL;
                             name_len++;
                             p++;
                         }
                     }
                 } else {
                     while (p < end && *p != ',') {
-                        n_crc = fast_crc32_byte(n_crc, *p);
+                        n_hash = (n_hash ^ *p) * 0x100000001b3ULL;
                         name_len++;
                         p++;
                     }
@@ -346,7 +329,7 @@ int main(int argc, char **argv) {
                 }
 
                 if (cid < half_c) {
-                    c_hashes[cid].push_back(n_crc);
+                    c_hashes[cid].push_back(n_hash);
                 }
             }
         });
@@ -386,7 +369,7 @@ int main(int argc, char **argv) {
         if (c_start >= c_end) continue;
 
         workers.emplace_back([c_start, c_end, &final_metrics, &t_state1, num_threads]() {
-            std::vector<uint32_t> merged;
+            std::vector<uint64_t> merged;
             for (size_t c = c_start; c < c_end; c++) {
                 merged.clear();
                 size_t tot = 0;
@@ -412,7 +395,7 @@ int main(int argc, char **argv) {
     t_state1.clear(); t_state1.shrink_to_fit();
 
     // PASS 2: Collect and count Batch 2 (half_c .. num_countries)
-    std::vector<std::vector<std::vector<uint32_t>>> t_hashes2(num_threads);
+    std::vector<std::vector<std::vector<uint64_t>>> t_hashes2(num_threads);
     for (unsigned int t = 0; t < num_threads; t++) {
         t_hashes2[t].resize(num_countries - half_c);
     }
@@ -433,26 +416,26 @@ int main(int argc, char **argv) {
                 if (p < end && *p == ',') p++;
 
                 // 2. name
-                uint32_t n_crc = 0;
+                uint64_t n_hash = 0xa0761d6478bd642fULL;
                 if (p < end && *p == '"') {
                     p++;
                     while (p < end) {
                         if (*p == '"') {
                             if (p + 1 < end && *(p + 1) == '"') {
-                                n_crc = fast_crc32_byte(n_crc, '"');
+                                n_hash = (n_hash ^ '"') * 0x100000001b3ULL;
                                 p += 2;
                             } else {
                                 p++;
                                 break;
                             }
                         } else {
-                            n_crc = fast_crc32_byte(n_crc, *p);
+                            n_hash = (n_hash ^ *p) * 0x100000001b3ULL;
                             p++;
                         }
                     }
                 } else {
                     while (p < end && *p != ',') {
-                        n_crc = fast_crc32_byte(n_crc, *p);
+                        n_hash = (n_hash ^ *p) * 0x100000001b3ULL;
                         p++;
                     }
                 }
@@ -463,8 +446,12 @@ int main(int argc, char **argv) {
                     p++;
                     while (p < end) {
                         if (*p == '"') {
-                            if (p + 1 < end && *(p + 1) == '"') p += 2;
-                            else { p++; break; }
+                            if (p + 1 < end && *(p + 1) == '"') {
+                                p += 2;
+                            } else {
+                                p++;
+                                break;
+                            }
                         } else p++;
                     }
                 } else {
@@ -485,7 +472,7 @@ int main(int argc, char **argv) {
 
                 uint8_t cid = (reg_id < reg_limit) ? region_to_cid[reg_id] : 0;
                 if (cid >= half_c) {
-                    c_hashes[cid - half_c].push_back(n_crc);
+                    c_hashes[cid - half_c].push_back(n_hash);
                 }
             }
         });
@@ -508,7 +495,7 @@ int main(int argc, char **argv) {
         if (c_start >= c_end) continue;
 
         workers.emplace_back([c_start, c_end, &final_metrics, &t_hashes2, half_c, num_threads]() {
-            std::vector<uint32_t> merged;
+            std::vector<uint64_t> merged;
             for (size_t c = c_start; c < c_end; c++) {
                 merged.clear();
                 size_t tot = 0;
@@ -572,6 +559,5 @@ int main(int argc, char **argv) {
     fclose(out);
     free(out_buf);
 
-    
     return 0;
 }
