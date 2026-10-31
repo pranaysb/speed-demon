@@ -11,7 +11,6 @@
 #include <string>
 #include <thread>
 #include <mutex>
-#include <chrono>
 
 #if defined(__linux__)
 #include <malloc.h>
@@ -131,13 +130,13 @@ struct EndpointCacheEntry {
     uint64_t hash;
     uint16_t ep_id;
     uint16_t len;
+    uint16_t pad;
 };
 
 int main(int argc, char **argv) {
 #if defined(__linux__)
     mallopt(M_ARENA_MAX, 1);
 #endif
-    auto t0 = std::chrono::high_resolution_clock::now();
     init_hour_strings();
 
     const char *data_dir = "/data";
@@ -177,7 +176,6 @@ int main(int argc, char **argv) {
     }
     chunk_ends[num_threads - 1] = data + file_size;
 
-    // Tight exact memory limit (275,000 records per thread = 2.2MB per thread)
     size_t max_records_per_thread = (file_size / num_threads / 70) + 30000;
     std::vector<RawItem *> thread_bufs(num_threads);
     std::vector<size_t> thread_recs(num_threads);
@@ -200,7 +198,7 @@ int main(int argc, char **argv) {
             uint64_t last_hour_prefix = 0;
             int last_hour_idx = -1;
 
-            EndpointCacheEntry tl_ep_cache[512] = {};
+            EndpointCacheEntry tl_ep_cache[1024] = {};
 
             while (p < end) {
                 uint64_t cur_hour_prefix;
@@ -215,35 +213,49 @@ int main(int argc, char **argv) {
                 }
 
                 p += 28;
-                while (*p != ' ') p++;
-                p++;
+
+                if (p + 8 < end) {
+                    if (p[3] == ' ') p += 4;
+                    else if (p[4] == ' ') p += 5;
+                    else if (p[5] == ' ') p += 6;
+                    else if (p[6] == ' ') p += 7;
+                    else if (p[7] == ' ') p += 8;
+                    else {
+                        while (p < end && *p != ' ') p++;
+                        if (p < end) p++;
+                    }
+                } else {
+                    while (p < end && *p != ' ') p++;
+                    if (p < end) p++;
+                }
 
                 const char *ep_start = (const char *)p;
-                while (*p != ' ') p++;
-                size_t ep_len = (const char *)p - ep_start;
-                p++;
+                const char *space_pos = (const char *)memchr(ep_start, ' ', end - p);
+                if (!space_pos) break;
+                size_t ep_len = space_pos - ep_start;
+                p = (const uint8_t *)space_pos + 1;
 
                 uint64_t h = fast_hash(ep_start, ep_len);
-                size_t c_idx = h & 511;
+                size_t c_idx = h & 1023;
                 uint16_t ep_id;
                 if (tl_ep_cache[c_idx].hash == h && tl_ep_cache[c_idx].len == ep_len &&
                     memcmp(g_endpoint_strings[tl_ep_cache[c_idx].ep_id].data(), ep_start, ep_len) == 0) {
                     ep_id = tl_ep_cache[c_idx].ep_id;
                 } else {
                     ep_id = get_or_insert_endpoint_with_hash(ep_start, ep_len, h);
-                    tl_ep_cache[c_idx] = {h, ep_id, (uint16_t)ep_len};
+                    tl_ep_cache[c_idx] = {h, ep_id, (uint16_t)ep_len, 0};
                 }
 
                 uint8_t is_err = (p[0] == '5') ? 1 : 0;
                 p += 4;
 
                 uint32_t lat = 0;
-                while (*p >= '0' && *p <= '9') {
+                while (p < end && *p >= '0' && *p <= '9') {
                     lat = lat * 10 + (*p - '0');
                     p++;
                 }
-                while (*p != '\n') p++;
-                p++;
+                while (p < end && *p != '\n') p++;
+                if (p < end && *p == '\n') p++;
 
                 h_counts[hour_idx]++;
                 *wptr++ = {lat, ep_id, (uint8_t)hour_idx, is_err};
@@ -284,10 +296,8 @@ int main(int argc, char **argv) {
         }
     }
 
-    // Allocate single contiguous buffer for all items grouped by hour
     RawItem *all_items = (RawItem *)malloc(total_records * sizeof(RawItem));
 
-    // Scatter by hour across threads in parallel
     for (unsigned int t = 0; t < num_threads; t++) {
         workers.emplace_back([t, &thread_bufs, &thread_recs, &thread_write_ptrs, all_items]() {
             const RawItem *src = thread_bufs[t];
@@ -407,7 +417,5 @@ int main(int argc, char **argv) {
     free(out_buf);
     free(all_items);
 
-    double total_ms = std::chrono::duration<double, std::milli>(std::chrono::high_resolution_clock::now() - t0).count();
-    printf("Track A Stream Total Time: %.2f ms\n", total_ms);
     return 0;
 }
