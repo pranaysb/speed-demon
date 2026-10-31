@@ -10,6 +10,7 @@
 #include <vector>
 #include <string>
 #include <thread>
+#include <mutex>
 #include <chrono>
 
 #if defined(__linux__)
