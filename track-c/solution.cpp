@@ -136,7 +136,7 @@ int main(int argc, char **argv) {
 
     const uint8_t *rp = rdata;
     const uint8_t *rend = rdata + rsize;
-    while (rp < rend && *rp != "\n"[0]) rp++; // skip header
+    while (rp < rend && *rp != '\n') rp++; // skip header
     if (rp < rend) rp++;
 
     while (rp < rend) {
@@ -147,10 +147,10 @@ int main(int argc, char **argv) {
         }
         if (rp < rend && *rp == ',') rp++;
         const uint8_t *cs = rp;
-        while (rp < rend && *rp != "\r"[0] && *rp != "\n"[0]) rp++;
+        while (rp < rend && *rp != '\r' && *rp != '\n') rp++;
         size_t clen = rp - cs;
-        if (rp < rend && *rp == "\r"[0]) rp++;
-        if (rp < rend && *rp == "\n"[0]) rp++;
+        if (rp < rend && *rp == '\r') rp++;
+        if (rp < rend && *rp == '\n') rp++;
         uint16_t cid = get_or_add_code3(cs, clen);
         if (reg_id < region_to_cid.size()) region_to_cid[reg_id] = cid;
     }

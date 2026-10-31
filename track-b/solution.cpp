@@ -16,6 +16,16 @@
 #include <malloc.h>
 #endif
 
+alignas(64) static uint8_t is_alnum_tab[256];
+alignas(64) static uint8_t to_lower_tab[256];
+
+static void init_tabs() {
+    for (int i = 0; i < 256; i++) {
+        is_alnum_tab[i] = ((i >= 'a' && i <= 'z') || (i >= 'A' && i <= 'Z') || (i >= '0' && i <= '9')) ? 1 : 0;
+        to_lower_tab[i] = (i >= 'A' && i <= 'Z') ? (uint8_t)(i + 32) : (uint8_t)i;
+    }
+}
+
 // FNV-1a 64-bit constants
 static constexpr uint64_t FNV_OFFSET_BASIS = 0xcbf29ce484222325ULL;
 static constexpr uint64_t FNV_PRIME = 0x100000001b3ULL;
@@ -111,6 +121,52 @@ static inline size_t intersect_raw(const uint32_t *a, size_t na, const uint32_t 
     return k;
 }
 
+static inline size_t intersect_galloping(const uint32_t *small, size_t n_small, const uint32_t *large, size_t n_large, uint32_t *out) {
+    size_t k = 0;
+    size_t j = 0;
+    for (size_t i = 0; i < n_small; i++) {
+        uint32_t target = small[i];
+        if (j >= n_large) break;
+        if (large[j] == target) {
+            out[k++] = target;
+            j++;
+            continue;
+        } else if (large[j] > target) {
+            continue;
+        }
+        size_t step = 1;
+        size_t prev = j;
+        while (prev + step < n_large && large[prev + step] < target) {
+            prev += step;
+            step <<= 1;
+        }
+        size_t high = std::min(prev + step, n_large);
+        size_t low = prev;
+        while (low < high) {
+            size_t mid = low + (high - low) / 2;
+            if (large[mid] < target) low = mid + 1;
+            else high = mid;
+        }
+        j = low;
+        if (j < n_large && large[j] == target) {
+            out[k++] = target;
+            j++;
+        }
+    }
+    return k;
+}
+
+static inline size_t intersect_adaptive(const uint32_t *a, size_t na, const uint32_t *b, size_t nb, uint32_t *out) {
+    if (na == 0 || nb == 0) return 0;
+    if (na * 16 < nb) {
+        return intersect_galloping(a, na, b, nb, out);
+    }
+    if (nb * 16 < na) {
+        return intersect_galloping(b, nb, a, na, out);
+    }
+    return intersect_raw(a, na, b, nb, out);
+}
+
 static inline size_t union_raw(const uint32_t *a, size_t na, const uint32_t *b, size_t nb, uint32_t *out) {
     size_t i = 0, j = 0, k = 0;
     while (i < na && j < nb) {
@@ -149,28 +205,18 @@ static inline bool check_phrase(const uint8_t *tp, size_t len, const std::vector
     size_t match_idx = 0;
 
     while (tp < tend) {
-        while (tp < tend) {
-            uint8_t c = *tp;
-            if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')) break;
-            tp++;
-        }
+        while (tp < tend && !is_alnum_tab[*tp]) tp++;
         if (tp >= tend) break;
 
         const uint8_t *tok_start = tp;
-        while (tp < tend) {
-            uint8_t c = *tp;
-            if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')) tp++;
-            else break;
-        }
+        while (tp < tend && is_alnum_tab[*tp]) tp++;
         size_t tok_len = tp - tok_start;
 
         auto match_term = [&](size_t idx) {
             const auto &term = terms[idx];
             if (term.size() != tok_len) return false;
             for (size_t i = 0; i < tok_len; i++) {
-                uint8_t c = tok_start[i];
-                if (c >= 'A' && c <= 'Z') c += 32;
-                if ((char)c != term[i]) return false;
+                if (to_lower_tab[tok_start[i]] != (uint8_t)term[i]) return false;
             }
             return true;
         };
@@ -216,6 +262,7 @@ int main(int argc, char **argv) {
 #if defined(__linux__)
     mallopt(M_ARENA_MAX, 1);
 #endif
+    init_tabs();
 
     const char *data_dir = "/data";
     const char *out_dir = "/out";
@@ -406,28 +453,15 @@ int main(int argc, char **argv) {
                 const uint8_t *tend = text_start + tlen;
 
                 while (tp < tend) {
-                    while (tp < tend) {
-                        uint8_t c = *tp;
-                        if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')) break;
-                        tp++;
-                    }
+                    while (tp < tend && !is_alnum_tab[*tp]) tp++;
                     if (tp >= tend) break;
 
                     uint64_t h = FNV_OFFSET_BASIS;
                     uint16_t tok_len = 0;
-                    while (tp < tend) {
-                        uint8_t c = *tp;
-                        if ((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9')) {
-                            h = (h ^ c) * FNV_PRIME;
-                            tok_len++;
-                            tp++;
-                        } else if (c >= 'A' && c <= 'Z') {
-                            h = (h ^ (c + 32)) * FNV_PRIME;
-                            tok_len++;
-                            tp++;
-                        } else {
-                            break;
-                        }
+                    while (tp < tend && is_alnum_tab[*tp]) {
+                        h = (h ^ to_lower_tab[*tp]) * FNV_PRIME;
+                        tok_len++;
+                        tp++;
                     }
 
                     int32_t tid_val = query_dict.find_by_hash(h, tok_len);
@@ -492,28 +526,15 @@ int main(int argc, char **argv) {
                 const uint8_t *tend = text_start + tlen;
 
                 while (tp < tend) {
-                    while (tp < tend) {
-                        uint8_t c = *tp;
-                        if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')) break;
-                        tp++;
-                    }
+                    while (tp < tend && !is_alnum_tab[*tp]) tp++;
                     if (tp >= tend) break;
 
                     uint64_t h = FNV_OFFSET_BASIS;
                     uint16_t tok_len = 0;
-                    while (tp < tend) {
-                        uint8_t c = *tp;
-                        if ((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9')) {
-                            h = (h ^ c) * FNV_PRIME;
-                            tok_len++;
-                            tp++;
-                        } else if (c >= 'A' && c <= 'Z') {
-                            h = (h ^ (c + 32)) * FNV_PRIME;
-                            tok_len++;
-                            tp++;
-                        } else {
-                            break;
-                        }
+                    while (tp < tend && is_alnum_tab[*tp]) {
+                        h = (h ^ to_lower_tab[*tp]) * FNV_PRIME;
+                        tok_len++;
+                        tp++;
                     }
 
                     int32_t tid_val = query_dict.find_by_hash(h, tok_len);
@@ -549,10 +570,9 @@ int main(int argc, char **argv) {
             out_vec.resize((end_q - start_q) * 96);
             char *out_ptr = out_vec.data();
 
-            uint32_t *raw_buf_a = (uint32_t *)malloc(MAX_DOCS * sizeof(uint32_t));
-            uint32_t *raw_buf_b = (uint32_t *)malloc(MAX_DOCS * sizeof(uint32_t));
-            uint32_t *cand_buf_a = (uint32_t *)malloc(MAX_DOCS * sizeof(uint32_t));
-            uint32_t *cand_buf_b = (uint32_t *)malloc(MAX_DOCS * sizeof(uint32_t));
+            // Reusable buffers: 2 buffers per thread instead of 4
+            uint32_t *buf_a = (uint32_t *)malloc(MAX_DOCS * sizeof(uint32_t));
+            uint32_t *buf_b = (uint32_t *)malloc(MAX_DOCS * sizeof(uint32_t));
             std::vector<uint32_t> matches;
             matches.reserve(1024);
 
@@ -568,8 +588,22 @@ int main(int argc, char **argv) {
                         p_data = &all_postings[st_pos];
                     }
 
-                    uint32_t *cur_res = raw_buf_a;
-                    uint32_t *cur_alt = raw_buf_b;
+                    if (pq.steps.size() == 1) {
+                        uint64_t id_sum = 0;
+                        for (size_t i = 0; i < p_len; i++) id_sum += p_data[i];
+                        out_ptr = fast_u64(out_ptr, p_len); *out_ptr++ = ' ';
+                        out_ptr = fast_u64(out_ptr, id_sum);
+                        size_t limit = std::min(p_len, (size_t)10);
+                        for (size_t i = 0; i < limit; i++) {
+                            *out_ptr++ = ' ';
+                            out_ptr = fast_u32(out_ptr, p_data[i]);
+                        }
+                        *out_ptr++ = '\n';
+                        continue;
+                    }
+
+                    uint32_t *cur_res = buf_a;
+                    uint32_t *cur_alt = buf_b;
                     size_t cur_len = p_len;
                     if (p_len > 0) memcpy(cur_res, p_data, p_len * sizeof(uint32_t));
 
@@ -586,7 +620,7 @@ int main(int argc, char **argv) {
                         }
 
                         if (op == OP_AND) {
-                            cur_len = intersect_raw(cur_res, cur_len, next_data, next_len, cur_alt);
+                            cur_len = intersect_adaptive(cur_res, cur_len, next_data, next_len, cur_alt);
                         } else if (op == OP_OR) {
                             cur_len = union_raw(cur_res, cur_len, next_data, next_len, cur_alt);
                         } else if (op == OP_NOT) {
@@ -623,8 +657,8 @@ int main(int argc, char **argv) {
                         if (pinfo[i].len == 0) { has_empty = true; break; }
                     }
 
-                    uint32_t *cand_res = cand_buf_a;
-                    uint32_t *cand_alt = cand_buf_b;
+                    uint32_t *cand_res = buf_a;
+                    uint32_t *cand_alt = buf_b;
                     size_t cand_len = 0;
 
                     if (!has_empty) {
@@ -635,7 +669,7 @@ int main(int argc, char **argv) {
                         memcpy(cand_res, pinfo[0].data, cand_len * sizeof(uint32_t));
 
                         for (size_t i = 1; i < num_pt && cand_len > 0; i++) {
-                            cand_len = intersect_raw(cand_res, cand_len, pinfo[i].data, pinfo[i].len, cand_alt);
+                            cand_len = intersect_adaptive(cand_res, cand_len, pinfo[i].data, pinfo[i].len, cand_alt);
                             std::swap(cand_res, cand_alt);
                         }
                     }
@@ -663,10 +697,8 @@ int main(int argc, char **argv) {
                 }
             }
             out_vec.resize(out_ptr - out_vec.data());
-            free(raw_buf_a);
-            free(raw_buf_b);
-            free(cand_buf_a);
-            free(cand_buf_b);
+            free(buf_a);
+            free(buf_b);
         });
     }
     for (auto &w : workers) w.join();

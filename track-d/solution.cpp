@@ -176,7 +176,7 @@ int main(int argc, char **argv) {
     uint32_t num_nodes = 0, num_edges = 0;
     p = fast_parse_u32(p, &num_nodes); p++;
     p = fast_parse_u32(p, &num_edges);
-    while (p < g_data + g_size && *p != "\n"[0]) p++;
+    while (p < g_data + g_size && *p != '\n') p++;
     if (p < g_data + g_size) p++;
 
     const uint8_t *edges_start = p;
@@ -192,7 +192,7 @@ int main(int argc, char **argv) {
         ep = fast_parse_u32(ep, &v);
         f_offsets[u + 1]++;
         b_offsets[v + 1]++;
-        while (ep < edges_end && *ep != "\n"[0]) ep++;
+        while (ep < edges_end && *ep != '\n') ep++;
         if (ep < edges_end) ep++;
     }
     for (uint32_t i = 0; i < num_nodes; i++) {
@@ -211,8 +211,8 @@ int main(int argc, char **argv) {
         ep = fast_parse_u32(ep, &u); ep++;
         ep = fast_parse_u32(ep, &v); ep++;
         ep = fast_parse_u32(ep, &w);
-        if (ep < edges_end && *ep == "\r"[0]) ep++;
-        if (ep < edges_end && *ep == "\n"[0]) ep++;
+        if (ep < edges_end && *ep == '\r') ep++;
+        if (ep < edges_end && *ep == '\n') ep++;
         f_edges[f_cur[u]++] = {v, w};
         b_edges[b_cur[v]++] = {u, w};
     }
@@ -264,12 +264,12 @@ int main(int argc, char **argv) {
     queries.reserve(2048);
     p = q_data; const uint8_t *q_end = q_data + q_size;
     while (p < q_end) {
-        while (p < q_end && (*p == ' ' || *p == "\n"[0] || *p == "\r"[0])) p++;
+        while (p < q_end && (*p == ' ' || *p == '\n' || *p == '\r')) p++;
         if (p >= q_end) break;
         Query q_item;
         p = fast_parse_u32(p, &q_item.s); while (p < q_end && *p == ' ') p++;
-        p = fast_parse_u32(p, &q_item.t); while (p < q_end && *p != "\n"[0]) p++;
-        if (p < q_end && *p == "\n"[0]) p++;
+        p = fast_parse_u32(p, &q_item.t); while (p < q_end && *p != '\n') p++;
+        if (p < q_end && *p == '\n') p++;
         queries.push_back(q_item);
     }
     madvise((void *)q_data, q_size, MADV_DONTNEED);
@@ -380,7 +380,7 @@ int main(int argc, char **argv) {
     char row[32];
     for (size_t i = 0; i < num_queries; i++) {
         char *rp = fast_i64(row, answers[i]);
-        *rp++ = "\n"[0];
+        *rp++ = '\n';
         fwrite(row, 1, rp - row, out);
     }
     fclose(out);

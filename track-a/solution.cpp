@@ -74,8 +74,7 @@ static inline uint64_t fast_hash(const char *p, size_t len) {
     return h ^ (h >> 32);
 }
 
-static uint16_t get_or_insert_endpoint(const char *p, size_t len) {
-    uint64_t h = fast_hash(p, len);
+static uint16_t get_or_insert_endpoint_with_hash(const char *p, size_t len, uint64_t h) {
     size_t idx = h & EP_MAP_MASK;
     while (g_ep_map[idx].str != nullptr) {
         if (g_ep_map[idx].hash == h && g_ep_map[idx].len == len &&
@@ -128,6 +127,12 @@ static inline char* fast_u64(char *p, uint64_t v) {
     return p;
 }
 
+struct EndpointCacheEntry {
+    uint64_t hash;
+    uint16_t ep_id;
+    uint16_t len;
+};
+
 int main(int argc, char **argv) {
 #if defined(__linux__)
     mallopt(M_ARENA_MAX, 1);
@@ -166,7 +171,7 @@ int main(int argc, char **argv) {
 
     for (unsigned int i = 0; i < num_threads; i++) {
         size_t s = (i * file_size) / num_threads;
-        if (i > 0) while (s < file_size && data[s - 1] != "\n"[0]) s++;
+        if (i > 0) while (s < file_size && data[s - 1] != '\n') s++;
         chunk_starts[i] = data + s;
         if (i > 0) chunk_ends[i - 1] = chunk_starts[i];
     }
@@ -195,6 +200,8 @@ int main(int argc, char **argv) {
             uint64_t last_hour_prefix = 0;
             int last_hour_idx = -1;
 
+            EndpointCacheEntry tl_ep_cache[512] = {};
+
             while (p < end) {
                 uint64_t cur_hour_prefix;
                 memcpy(&cur_hour_prefix, p + 5, 8);
@@ -216,7 +223,16 @@ int main(int argc, char **argv) {
                 size_t ep_len = (const char *)p - ep_start;
                 p++;
 
-                uint16_t ep_id = get_or_insert_endpoint(ep_start, ep_len);
+                uint64_t h = fast_hash(ep_start, ep_len);
+                size_t c_idx = h & 511;
+                uint16_t ep_id;
+                if (tl_ep_cache[c_idx].hash == h && tl_ep_cache[c_idx].len == ep_len &&
+                    memcmp(g_endpoint_strings[tl_ep_cache[c_idx].ep_id].data(), ep_start, ep_len) == 0) {
+                    ep_id = tl_ep_cache[c_idx].ep_id;
+                } else {
+                    ep_id = get_or_insert_endpoint_with_hash(ep_start, ep_len, h);
+                    tl_ep_cache[c_idx] = {h, ep_id, (uint16_t)ep_len};
+                }
 
                 uint8_t is_err = (p[0] == '5') ? 1 : 0;
                 p += 4;
@@ -226,7 +242,7 @@ int main(int argc, char **argv) {
                     lat = lat * 10 + (*p - '0');
                     p++;
                 }
-                while (*p != "\n"[0]) p++;
+                while (*p != '\n') p++;
                 p++;
 
                 h_counts[hour_idx]++;
@@ -375,7 +391,7 @@ int main(int argc, char **argv) {
                     cur = fast_u32(cur, p95); *cur++ = ' ';
                     cur = fast_u32(cur, p99); *cur++ = ' ';
                     cur = fast_u32(cur, errs); *cur++ = ' ';
-                    cur = fast_u64(cur, ppm); *cur++ = "\n"[0];
+                    cur = fast_u64(cur, ppm); *cur++ = '\n';
                     out_str.append(line_buf, cur - line_buf);
                 }
             }
