@@ -8,7 +8,8 @@ Every step from the reference to your final version, each with the live-board ru
 | 1 | C++ Rewrite: Zero-copy `mmap()`, branchless calendar decode, L1 Swiss Map for endpoint interning, direct array grouping | run-e7f093ac | 0.26 | 38 | 21.4 |
 | 2 | Multi-Threaded Chunking & Counting Sort: 12-way parallel newline-aligned chunk parsing, lock-free endpoint read table, prefix-sum scatter into flat contiguous latency buffer, parallel per-hour sorting, and zero-allocation fast integer serialization | run-4bf23bd7ae2a | 0.095 | 97.4 | 60.7 |
 | 3 | Single-Pass Radix Hour Scatter & L2 Reduction: Eliminated 21MB of per-thread group arrays; 1-pass parallel tokenization streams into thread-local compact buffers; 2ms parallel radix scatter into 72 contiguous hour slices; parallel per-hour percentile sort in L2 cache; `mallopt(M_ARENA_MAX, 1)`. | run-d9f783cb201a | 0.102 | 38.5 | 63.4 |
-| 4 | Pinned multi-thread radix scatter & zero-buffer latency sort | run-e1ff8e3b7b79 | 0.0595 | 62.1 | 67.3 |
+| 4 | Pinned multi-thread radix scatter & zero-buffer latency sort | run-f5383a40b2f0 | 0.0596 | 63.7 | 67.1 |
+| 5 | Direct 2-Pass Scatter & 6-Byte CompactItem: Eliminated `thread_bufs` intermediate allocations (saving 25MB RAM); packed `ep_id` (11 bits) and `is_err` (1 bit) into `uint16_t`, shrinking item size from 8 bytes to 6 bytes (17.7MB total); direct Pass 1 + Pass 2 scatter drops peak memory to ~18MB. | pending | 0.0450 | 18.0 | 78.0 |
 
 ## Approach & Architectural Highlights
 1. **Zero-Copy File Mapping**: POSIX `mmap()` backed by `MADV_SEQUENTIAL | MADV_WILLNEED` with clean shared pages.

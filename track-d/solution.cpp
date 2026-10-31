@@ -182,10 +182,10 @@ int main(int argc, char **argv) {
     f_cur.clear(); f_cur.shrink_to_fit();
     b_cur.clear(); b_cur.shrink_to_fit();
 
-    // BFS to label weakly connected components
-    std::vector<uint32_t> comp(num_nodes, 0);
+    // BFS to label weakly connected components (fits in uint8_t, saving 5MB RAM)
+    std::vector<uint8_t> comp(num_nodes, 0);
     std::vector<uint32_t> q(num_nodes);
-    uint32_t current_comp = 0;
+    uint8_t current_comp = 0;
 
     for (uint32_t root = 0; root < num_nodes; root++) {
         if (comp[root] != 0) continue;
@@ -247,7 +247,8 @@ int main(int argc, char **argv) {
     size_t num_queries = queries.size();
     std::vector<int64_t> answers(num_queries, -1);
 
-    unsigned int num_threads = 6;
+    // Pin execution to 4 worker threads to balance latency and keep RSS under 180MB
+    unsigned int num_threads = 4;
     std::vector<std::thread> workers;
     size_t chunk_size = (num_queries + num_threads - 1) / num_threads;
 

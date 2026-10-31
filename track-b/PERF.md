@@ -8,7 +8,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 1 | C++ Rewrite: Inverted index with two-pointer sorted set operations, zero-copy `mmap` DocSpans, multi-threaded query execution | run-201eb8f6f162 | 4.70 | 258 | 30.7 |
 | 2 | Query-Guided Indexing & Parallel Tokenization: Read queries first to filter vocabulary to only relevant terms (discarding 87% of corpus words), 12-way parallel document indexing, zero-allocation ping-pong boolean set evaluation | run-d6b537697fc5 | 1.289 | 283.3 | 43.7 |
 | 3 | Flat CSR Inverted Index & Length-Sorted Phrase Intersector: Eliminated 908,964 `std::vector` instances into a single flat CSR matrix (300KB offsets + 88MB postings); phrase terms sorted by posting length (smallest first) shrinking candidate sets by 99.8%; zero-allocation in-place phrase scanner; `mallopt(M_ARENA_MAX, 1)`. | run-c5db114dbd42 | 1.276 | 143.1 | 46.3 |
-| 4 | Epoch-Tagged $O(1)$ Term Deduplication: Eliminated 500,000 document vector allocations and introsorts via L2-resident `last_doc_seen[term_id]` tracking array; drops CPU user time from 8.5s to 6.4s locally with zero vector thrashing. | pending | 0.350 | 48.0 | 70.0 |
+| 4 | Epoch-Tagged $O(1)$ Term Deduplication: Eliminated 500,000 document vector allocations and introsorts via L2-resident `last_doc_seen[term_id]` tracking array; dropped Falkenstein CPU time from 1.30s to 1.056s. | run-478e9ecce38b | 1.057 | 146.2 | 48.4 |
 
 ## Approach & Architectural Highlights
 1. **Query-Guided Vocabulary Pruning**: We read `queries.txt` first to populate a compact L2/L3-resident hash dictionary containing ONLY the ~75,000 unique query terms. The remaining 525,000 corpus terms are skipped with zero allocations, eliminating 87% of all inverted index postings lists.

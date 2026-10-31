@@ -76,11 +76,6 @@ struct FinalCountryAgg {
     uint64_t note_bytes = 0;
 };
 
-struct RecordHash {
-    uint64_t hash;
-    uint8_t cid;
-};
-
 int main(int argc, char **argv) {
 #if defined(__linux__)
     mallopt(M_ARENA_MAX, 1);
@@ -96,8 +91,6 @@ int main(int argc, char **argv) {
             out_dir = argv[++i];
         }
     }
-
-
 
     // 1. Load regions.csv
     char regions_path[1024];
@@ -213,23 +206,106 @@ int main(int argc, char **argv) {
     }
     chunk_ends[num_threads - 1] = data + file_size;
 
-    std::vector<std::vector<ThreadCountryAgg>> thread_aggs(num_threads);
-    std::vector<std::vector<RecordHash>> thread_hashes(num_threads);
-
-    for (unsigned int t = 0; t < num_threads; t++) {
-        thread_aggs[t].resize(num_countries);
-        // Estimate ~4M / num_threads records
-        thread_hashes[t].reserve(4000000 / num_threads + 32768);
-    }
-
+    // Pass 1: Quick count of records per country per thread
+    std::vector<std::vector<uint32_t>> thread_country_counts(num_threads);
     std::vector<std::thread> workers;
 
     for (unsigned int t = 0; t < num_threads; t++) {
-        workers.emplace_back([t, &thread_aggs, &thread_hashes, &chunk_starts, &chunk_ends, &region_to_cid]() {
+        thread_country_counts[t].resize(num_countries, 0);
+        workers.emplace_back([t, &thread_country_counts, &chunk_starts, &chunk_ends, &region_to_cid]() {
+            const uint8_t *p = chunk_starts[t];
+            const uint8_t *end = chunk_ends[t];
+            auto &counts = thread_country_counts[t];
+            size_t reg_limit = region_to_cid.size();
+
+            while (p < end) {
+                if (end - p >= 3 && p[0] == 0xEF && p[1] == 0xBB && p[2] == 0xBF) p += 3;
+                if (p >= end) break;
+
+                // 1. id
+                while (p < end && *p >= '0' && *p <= '9') p++;
+                if (p < end && *p == ',') p++;
+
+                // 2. name
+                if (p < end && *p == '"') {
+                    p++;
+                    while (p < end) {
+                        if (*p == '"') {
+                            if (p + 1 < end && *(p + 1) == '"') p += 2;
+                            else { p++; break; }
+                        } else p++;
+                    }
+                } else {
+                    while (p < end && *p != ',') p++;
+                }
+                if (p < end && *p == ',') p++;
+
+                // 3. note
+                if (p < end && *p == '"') {
+                    p++;
+                    while (p < end) {
+                        if (*p == '"') {
+                            if (p + 1 < end && *(p + 1) == '"') p += 2;
+                            else { p++; break; }
+                        } else p++;
+                    }
+                } else {
+                    while (p < end && *p != ',') p++;
+                }
+                if (p < end && *p == ',') p++;
+
+                // 4. region_id
+                uint32_t reg_id = 0;
+                while (p < end && *p >= '0' && *p <= '9') {
+                    reg_id = reg_id * 10 + (*p - '0');
+                    p++;
+                }
+                uint8_t cid = (reg_id < reg_limit) ? region_to_cid[reg_id] : 0;
+                counts[cid]++;
+
+                // skip amount to end of line
+                while (p < end && *p != '\n') p++;
+                if (p < end && *p == '\n') p++;
+            }
+        });
+    }
+    for (auto &w : workers) w.join();
+    workers.clear();
+
+    // Compute country offsets and thread base write pointers
+    std::vector<uint32_t> country_offsets(num_countries + 1, 0);
+    std::vector<std::vector<uint32_t>> thread_write_ptrs(num_threads);
+    for (unsigned int t = 0; t < num_threads; t++) thread_write_ptrs[t].resize(num_countries, 0);
+
+    for (size_t c = 0; c < num_countries; c++) {
+        uint32_t s = 0;
+        for (unsigned int t = 0; t < num_threads; t++) {
+            thread_write_ptrs[t][c] = s;
+            s += thread_country_counts[t][c];
+        }
+        country_offsets[c + 1] = country_offsets[c] + s;
+    }
+    for (size_t c = 0; c < num_countries; c++) {
+        uint32_t base = country_offsets[c];
+        for (unsigned int t = 0; t < num_threads; t++) {
+            thread_write_ptrs[t][c] += base;
+        }
+    }
+    thread_country_counts.clear();
+
+    size_t total_records = country_offsets[num_countries];
+    uint64_t *sorted_hashes = (uint64_t *)malloc(total_records * sizeof(uint64_t));
+
+    // Pass 2: Parse and scatter DIRECTLY into sorted_hashes (ZERO intermediate vectors!)
+    std::vector<std::vector<ThreadCountryAgg>> thread_aggs(num_threads);
+    for (unsigned int t = 0; t < num_threads; t++) thread_aggs[t].resize(num_countries);
+
+    for (unsigned int t = 0; t < num_threads; t++) {
+        workers.emplace_back([t, &thread_aggs, &chunk_starts, &chunk_ends, &region_to_cid, &thread_write_ptrs, sorted_hashes]() {
             const uint8_t *p = chunk_starts[t];
             const uint8_t *end = chunk_ends[t];
             auto &aggs = thread_aggs[t];
-            auto &th_hashes = thread_hashes[t];
+            auto &wr = thread_write_ptrs[t];
             size_t reg_limit = region_to_cid.size();
 
             while (p < end) {
@@ -350,7 +426,9 @@ int main(int argc, char **argv) {
                 }
                 ca.name_bytes += name_len;
                 ca.note_bytes += note_len;
-                th_hashes.push_back({n_hash, cid});
+
+                uint32_t pos = wr[cid]++;
+                sorted_hashes[pos] = n_hash;
             }
         });
     }
@@ -359,21 +437,14 @@ int main(int argc, char **argv) {
 
     munmap((void *)data, file_size);
     close(fd);
+    thread_write_ptrs.clear();
 
-
-
-    // 3. Merge scalar aggregates & compute country offsets
+    // 3. Merge scalar aggregates & sort distinct names per country
     std::vector<FinalCountryAgg> final_aggs(num_countries);
     for (size_t c = 0; c < num_countries; c++) {
         final_aggs[c].key = country_names[c];
-    }
-
-    std::vector<std::vector<uint32_t>> thread_country_counts(num_threads);
-    for (unsigned int t = 0; t < num_threads; t++) {
-        thread_country_counts[t].resize(num_countries, 0);
-        for (size_t c = 0; c < num_countries; c++) {
+        for (unsigned int t = 0; t < num_threads; t++) {
             const auto &ca = thread_aggs[t][c];
-            thread_country_counts[t][c] = (uint32_t)ca.count;
             if (ca.count == 0) continue;
             auto &fa = final_aggs[c];
             fa.count += ca.count;
@@ -391,48 +462,11 @@ int main(int argc, char **argv) {
             }
         }
     }
-
-    // Prefix sum country offsets
-    std::vector<uint32_t> country_offsets(num_countries + 1, 0);
-    std::vector<std::vector<uint32_t>> thread_write_ptrs(num_threads);
-    for (unsigned int t = 0; t < num_threads; t++) thread_write_ptrs[t].resize(num_countries, 0);
-
-    for (size_t c = 0; c < num_countries; c++) {
-        uint32_t s = 0;
-        for (unsigned int t = 0; t < num_threads; t++) {
-            thread_write_ptrs[t][c] = s;
-            s += thread_country_counts[t][c];
-        }
-        country_offsets[c + 1] = country_offsets[c] + s;
-    }
-    for (size_t c = 0; c < num_countries; c++) {
-        uint32_t base = country_offsets[c];
-        for (unsigned int t = 0; t < num_threads; t++) {
-            thread_write_ptrs[t][c] += base;
-        }
-    }
-
-    size_t total_records = country_offsets[num_countries];
-    std::vector<uint64_t> sorted_hashes(total_records);
-
-    // Parallel scatter of hashes into flat contiguous per-country blocks
-    for (unsigned int t = 0; t < num_threads; t++) {
-        workers.emplace_back([t, &thread_hashes, &thread_write_ptrs, &sorted_hashes]() {
-            auto &wr = thread_write_ptrs[t];
-            const auto &th = thread_hashes[t];
-            for (const auto &rh : th) {
-                uint32_t dest = wr[rh.cid]++;
-                sorted_hashes[dest] = rh.hash;
-            }
-        });
-    }
-    for (auto &w : workers) w.join();
-    workers.clear();
-    thread_hashes.clear(); thread_hashes.shrink_to_fit();
+    thread_aggs.clear();
 
     // Parallel sort & distinct count for each country
     for (unsigned int t = 0; t < num_threads; t++) {
-        workers.emplace_back([t, num_threads, num_countries, &final_aggs, &country_offsets, &sorted_hashes]() {
+        workers.emplace_back([t, num_threads, num_countries, &final_aggs, &country_offsets, sorted_hashes]() {
             for (size_t c = t; c < num_countries; c += num_threads) {
                 uint32_t st = country_offsets[c];
                 uint32_t en = country_offsets[c + 1];
@@ -444,8 +478,6 @@ int main(int argc, char **argv) {
     }
     for (auto &w : workers) w.join();
     workers.clear();
-
-
 
     // Sort countries by key in byte order
     std::vector<size_t> sorted_cids;
@@ -486,6 +518,7 @@ int main(int argc, char **argv) {
     }
     fclose(out);
     free(out_buf);
+    free(sorted_hashes);
 
     return 0;
 }

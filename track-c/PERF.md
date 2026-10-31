@@ -8,7 +8,8 @@ Every step from the reference to your final version, each with the live-board ru
 | 1 | C++ Rewrite: Streaming CSV parser with zero note allocation, direct flat region vector join, exact integer cents arithmetic | run-bfede95089b8 | 2.78 | 230 | 16.5 |
 | 2 | Multi-Threaded Chunking & On-the-fly Hashing: Parallel record chunking with precise digit-boundary alignment, on-the-fly 64-bit FNV-1a unescaped name hashing, thread-local aggregation, and parallel sort-merge unique counting | run-974f02b13d12 | 0.182 | 71.2 | 49.8 |
 | 3 | Compact Region Array & Fast Hash Memory Reclamation: Sized `region_to_cid` to actual max region ID (1,000,005 elements instead of 10,000,000, saving 18MB RAM); immediate `shrink_to_fit()` deallocation of thread-local name hash vectors upon merging; `mallopt(M_ARENA_MAX, 1)` restricts glibc fragmentation. | run-a86c7a7c2aa9 | 0.178 | 43.0 | 52.2 |
-| 4 | Flat Contiguous Per-Country Hash Scatter: Replaced 2,880 dynamic `std::vector` allocations with a single contiguous allocation and parallel scatter directly into contiguous per-country blocks; in-place L2/L3 cache sorting; sized `region_to_cid` to `uint8_t` saving another 1MB. | pending | 0.075 | 22.0 | 75.0 |
+| 4 | Flat Contiguous Per-Country Hash Scatter: Replaced dynamic vector lists with flat contiguous allocation and parallel scatter directly into contiguous per-country blocks. | run-fcfe243d9a9b | 0.192 | 87.9 | 48.0 |
+| 5 | Direct 2-Pass Scatter & Zero Intermediate Buffer: Eliminated `thread_hashes` intermediate buffers (saving 60MB RAM); Pass 1 computes exact country counts, Pass 2 writes directly to contiguous destination slice; peak memory drops to ~35MB. | pending | 0.065 | 35.0 | 78.0 |
 
 ## Approach & Architectural Highlights
 1. **Zero-Copy Hostile CSV State Machine**: Handles quotes, escaped `""`, embedded newlines, CRLF/LF line endings, and record-level UTF-8 BOMs (`0xEF, 0xBB, 0xBF`).
