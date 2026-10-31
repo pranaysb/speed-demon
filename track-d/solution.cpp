@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <vector>
 #include <thread>
+#include <atomic>
 #include <chrono>
 
 #if defined(__linux__)
@@ -73,7 +74,6 @@ public:
     }
 };
 
-// Compact L2-resident open-addressing distance table (131,072 slots = 2MB)
 struct DistMap {
     static constexpr size_t CAP = 131072;
     static constexpr size_t MASK = CAP - 1;
@@ -98,7 +98,6 @@ struct DistMap {
         touched.clear();
     }
 
-    // Returns dist or UINT64_MAX if not found
     inline uint64_t get(uint32_t u) const {
         size_t idx = (u * 2654435761ULL) & MASK;
         while (table[idx].node != EMPTY) {
@@ -108,7 +107,6 @@ struct DistMap {
         return UINT64_MAX;
     }
 
-    // Inserts or updates. Returns true if updated/inserted with smaller dist
     inline bool update(uint32_t u, uint64_t d) {
         size_t idx = (u * 2654435761ULL) & MASK;
         while (table[idx].node != EMPTY) {
@@ -181,51 +179,100 @@ int main(int argc, char **argv) {
 
     const uint8_t *edges_start = p;
     const uint8_t *edges_end = g_data + g_size;
+    size_t total_bytes = edges_end - edges_start;
+
+    unsigned int num_threads = std::thread::hardware_concurrency();
+    if (num_threads == 0) num_threads = 4;
+
+    std::vector<const uint8_t *> chunk_starts(num_threads);
+    std::vector<const uint8_t *> chunk_ends(num_threads);
+
+    for (unsigned int t = 0; t < num_threads; t++) {
+        const uint8_t *cs = edges_start + (total_bytes * t) / num_threads;
+        if (t > 0) {
+            while (cs < edges_end && *(cs - 1) != '\n') cs++;
+        }
+        chunk_starts[t] = cs;
+        if (t > 0) chunk_ends[t - 1] = cs;
+    }
+    chunk_ends[num_threads - 1] = edges_end;
+
+    std::vector<std::atomic<uint32_t>> f_offsets_atomic(num_nodes + 1);
+    std::vector<std::atomic<uint32_t>> b_offsets_atomic(num_nodes + 1);
+    for (uint32_t i = 0; i <= num_nodes; i++) {
+        f_offsets_atomic[i].store(0, std::memory_order_relaxed);
+        b_offsets_atomic[i].store(0, std::memory_order_relaxed);
+    }
+
+    std::vector<std::thread> workers;
+    for (unsigned int t = 0; t < num_threads; t++) {
+        workers.emplace_back([t, &chunk_starts, &chunk_ends, &f_offsets_atomic, &b_offsets_atomic]() {
+            const uint8_t *cur = chunk_starts[t];
+            const uint8_t *cend = chunk_ends[t];
+            while (cur < cend) {
+                uint32_t u, v;
+                cur = fast_parse_u32(cur, &u); cur++;
+                cur = fast_parse_u32(cur, &v);
+                f_offsets_atomic[u + 1].fetch_add(1, std::memory_order_relaxed);
+                b_offsets_atomic[v + 1].fetch_add(1, std::memory_order_relaxed);
+                while (cur < cend && *cur != '\n') cur++;
+                if (cur < cend) cur++;
+            }
+        });
+    }
+    for (auto &w : workers) w.join();
+    workers.clear();
 
     std::vector<uint32_t> f_offsets(num_nodes + 1, 0);
     std::vector<uint32_t> b_offsets(num_nodes + 1, 0);
-
-    const uint8_t *ep = edges_start;
-    while (ep < edges_end) {
-        uint32_t u, v;
-        ep = fast_parse_u32(ep, &u); ep++;
-        ep = fast_parse_u32(ep, &v);
-        f_offsets[u + 1]++;
-        b_offsets[v + 1]++;
-        while (ep < edges_end && *ep != '\n') ep++;
-        if (ep < edges_end) ep++;
+    uint32_t f_tot = 0, b_tot = 0;
+    for (uint32_t i = 0; i <= num_nodes; i++) {
+        f_tot += f_offsets_atomic[i].load(std::memory_order_relaxed);
+        b_tot += b_offsets_atomic[i].load(std::memory_order_relaxed);
+        f_offsets[i] = f_tot;
+        b_offsets[i] = b_tot;
     }
+
+    // Atomic cursors for parallel edge writing
+    std::vector<std::atomic<uint32_t>> f_cur(num_nodes);
+    std::vector<std::atomic<uint32_t>> b_cur(num_nodes);
     for (uint32_t i = 0; i < num_nodes; i++) {
-        f_offsets[i + 1] += f_offsets[i];
-        b_offsets[i + 1] += b_offsets[i];
+        f_cur[i].store(f_offsets[i], std::memory_order_relaxed);
+        b_cur[i].store(b_offsets[i], std::memory_order_relaxed);
     }
 
-    std::vector<uint32_t> f_cur = f_offsets;
-    std::vector<uint32_t> b_cur = b_offsets;
     std::vector<Edge> f_edges(num_edges);
     std::vector<Edge> b_edges(num_edges);
 
-    ep = edges_start;
-    while (ep < edges_end) {
-        uint32_t u, v, w;
-        ep = fast_parse_u32(ep, &u); ep++;
-        ep = fast_parse_u32(ep, &v); ep++;
-        ep = fast_parse_u32(ep, &w);
-        if (ep < edges_end && *ep == '\r') ep++;
-        if (ep < edges_end && *ep == '\n') ep++;
-        f_edges[f_cur[u]++] = {v, w};
-        b_edges[b_cur[v]++] = {u, w};
+    for (unsigned int t = 0; t < num_threads; t++) {
+        workers.emplace_back([t, &chunk_starts, &chunk_ends, &f_cur, &b_cur, &f_edges, &b_edges]() {
+            const uint8_t *cur = chunk_starts[t];
+            const uint8_t *cend = chunk_ends[t];
+            while (cur < cend) {
+                uint32_t u, v, w;
+                cur = fast_parse_u32(cur, &u); cur++;
+                cur = fast_parse_u32(cur, &v); cur++;
+                cur = fast_parse_u32(cur, &w);
+                if (cur < cend && *cur == '\r') cur++;
+                if (cur < cend && *cur == '\n') cur++;
+                uint32_t pos_f = f_cur[u].fetch_add(1, std::memory_order_relaxed);
+                uint32_t pos_b = b_cur[v].fetch_add(1, std::memory_order_relaxed);
+                f_edges[pos_f] = {v, w};
+                b_edges[pos_b] = {u, w};
+            }
+        });
     }
+    for (auto &w : workers) w.join();
+    workers.clear();
+
     madvise((void *)g_data, g_size, MADV_DONTNEED);
     munmap((void *)g_data, g_size);
 #if defined(__linux__)
     posix_fadvise(g_fd, 0, 0, POSIX_FADV_DONTNEED);
 #endif
     close(g_fd);
-    f_cur.clear(); f_cur.shrink_to_fit();
-    b_cur.clear(); b_cur.shrink_to_fit();
 
-    // Fast BFS component labeling (comp array: 1.7 MB)
+    // Fast BFS component labeling
     std::vector<uint8_t> comp(num_nodes, 0);
     std::vector<uint32_t> q(num_nodes);
     uint8_t current_comp = 0;
@@ -282,11 +329,10 @@ int main(int argc, char **argv) {
     size_t num_queries = queries.size();
     std::vector<int64_t> answers(num_queries, -1);
 
-    unsigned int num_threads = std::min(12u, std::max(4u, std::thread::hardware_concurrency()));
-    std::vector<std::thread> workers;
-    size_t chunk_size = (num_queries + num_threads - 1) / num_threads;
+    unsigned int q_threads = std::min(12u, std::max(4u, std::thread::hardware_concurrency()));
+    size_t chunk_size = (num_queries + q_threads - 1) / q_threads;
 
-    for (unsigned int tid = 0; tid < num_threads; tid++) {
+    for (unsigned int tid = 0; tid < q_threads; tid++) {
         size_t start_q = tid * chunk_size;
         size_t end_q = std::min(start_q + chunk_size, num_queries);
         if (start_q >= end_q) continue;
@@ -387,6 +433,6 @@ int main(int argc, char **argv) {
     free(out_buf);
 
     double ms = std::chrono::duration<double, std::milli>(std::chrono::high_resolution_clock::now() - t_start).count();
-    printf("Track D DistMap Total Time: %.2f ms\n", ms);
+    printf("Track D Multi-threaded Parallel CSR Total Time: %.2f ms\n", ms);
     return 0;
 }

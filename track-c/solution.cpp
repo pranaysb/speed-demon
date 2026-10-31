@@ -386,52 +386,43 @@ int main(int argc, char **argv) {
         final_aggs[c].key = country_names[c];
     }
 
-    std::vector<std::vector<uint64_t>> country_all_hashes(num_countries);
-    for (size_t c = 0; c < num_countries; c++) {
-        size_t tot_h = 0;
-        for (unsigned int t = 0; t < num_threads; t++) {
-            tot_h += thread_aggs[t][c].name_hashes.size();
-        }
-        country_all_hashes[c].reserve(tot_h);
-        for (unsigned int t = 0; t < num_threads; t++) {
-            auto &ca = thread_aggs[t][c];
-            FinalCountryAgg &fa = final_aggs[c];
-            fa.count += ca.count;
-            fa.id_sum += ca.id_sum;
-            fa.amount_sum += ca.amount_sum;
-            if (ca.has_amount) {
-                if (fa.count == ca.count) {
-                    fa.amount_min = ca.amount_min;
-                    fa.amount_max = ca.amount_max;
-                } else {
-                    if (ca.amount_min < fa.amount_min) fa.amount_min = ca.amount_min;
-                    if (ca.amount_max > fa.amount_max) fa.amount_max = ca.amount_max;
-                }
-            }
-            fa.name_bytes += ca.name_bytes;
-            fa.note_bytes += ca.note_bytes;
-            country_all_hashes[c].insert(country_all_hashes[c].end(), ca.name_hashes.begin(), ca.name_hashes.end());
-            ca.name_hashes.clear();
-            ca.name_hashes.shrink_to_fit();
-        }
-    }
-
     for (unsigned int t = 0; t < num_threads; t++) {
-        workers.emplace_back([t, num_threads, num_countries, &country_all_hashes, &final_aggs]() {
+        workers.emplace_back([t, num_threads, num_countries, &final_aggs, &thread_aggs]() {
+            std::vector<uint64_t> all_hashes;
             for (size_t c = t; c < num_countries; c += num_threads) {
-                auto &vec = country_all_hashes[c];
-                if (vec.empty()) {
-                    final_aggs[c].names_distinct = 0;
-                    continue;
+                FinalCountryAgg &fa = final_aggs[c];
+                all_hashes.clear();
+
+                for (unsigned int thr = 0; thr < num_threads; thr++) {
+                    auto &ca = thread_aggs[thr][c];
+                    if (ca.count == 0) continue;
+                    fa.count += ca.count;
+                    fa.id_sum += ca.id_sum;
+                    fa.amount_sum += ca.amount_sum;
+                    if (ca.has_amount) {
+                        if (fa.count == ca.count) {
+                            fa.amount_min = ca.amount_min;
+                            fa.amount_max = ca.amount_max;
+                        } else {
+                            if (ca.amount_min < fa.amount_min) fa.amount_min = ca.amount_min;
+                            if (ca.amount_max > fa.amount_max) fa.amount_max = ca.amount_max;
+                        }
+                    }
+                    fa.name_bytes += ca.name_bytes;
+                    fa.note_bytes += ca.note_bytes;
+                    all_hashes.insert(all_hashes.end(), ca.name_hashes.begin(), ca.name_hashes.end());
+                    ca.name_hashes.clear();
+                    ca.name_hashes.shrink_to_fit();
                 }
-                std::sort(vec.begin(), vec.end());
-                size_t d = 1;
-                for (size_t i = 1; i < vec.size(); i++) {
-                    if (vec[i] != vec[i - 1]) d++;
+
+                if (!all_hashes.empty()) {
+                    std::sort(all_hashes.begin(), all_hashes.end());
+                    size_t d = 1;
+                    for (size_t i = 1; i < all_hashes.size(); i++) {
+                        if (all_hashes[i] != all_hashes[i - 1]) d++;
+                    }
+                    fa.names_distinct = d;
                 }
-                final_aggs[c].names_distinct = d;
-                vec.clear();
-                vec.shrink_to_fit();
             }
         });
     }
