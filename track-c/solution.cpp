@@ -305,6 +305,8 @@ int main(int argc, char **argv) {
             const uint8_t *end = chunk_ends[t];
             auto &aggs = thread_aggs[t];
             size_t reg_limit = region_to_cid.size();
+            struct L1NameEntry { uint64_t hash; uint32_t nid; };
+            L1NameEntry l1_names[2048] = {};
 
             while (p < end) {
                 if (end - p >= 3 && p[0] == 0xEF && p[1] == 0xBB && p[2] == 0xBF) p += 3;
@@ -327,8 +329,19 @@ int main(int argc, char **argv) {
                         const uint8_t *next_q = find_char_simd(p, end, '"');
                         size_t span = next_q - p;
                         name_len += span;
-                        for (size_t i = 0; i < span; i++) {
-                            n_hash = (n_hash ^ p[i]) * 0x100000001b3ULL;
+                        size_t rem = span;
+                        const uint8_t *sp_p = p;
+                        while (rem >= 8) {
+                            uint64_t v;
+                            memcpy(&v, sp_p, 8);
+                            n_hash = (n_hash ^ v) * 0x517cc1b727220a95ULL;
+                            sp_p += 8;
+                            rem -= 8;
+                        }
+                        while (rem > 0) {
+                            n_hash = (n_hash ^ *sp_p) * 0x100000001b3ULL;
+                            sp_p++;
+                            rem--;
                         }
                         p = next_q;
                         if (p < end) {
@@ -346,8 +359,19 @@ int main(int argc, char **argv) {
                 } else {
                     const uint8_t *nc = find_char_simd(p, end, ',');
                     name_len = nc - p;
-                    for (size_t i = 0; i < name_len; i++) {
-                        n_hash = (n_hash ^ p[i]) * 0x100000001b3ULL;
+                    size_t rem = name_len;
+                    const uint8_t *sp_p = p;
+                    while (rem >= 8) {
+                        uint64_t v;
+                        memcpy(&v, sp_p, 8);
+                        n_hash = (n_hash ^ v) * 0x517cc1b727220a95ULL;
+                        sp_p += 8;
+                        rem -= 8;
+                    }
+                    while (rem > 0) {
+                        n_hash = (n_hash ^ *sp_p) * 0x100000001b3ULL;
+                        sp_p++;
+                        rem--;
                     }
                     p = nc;
                     if (p < end && *p == ',') p++;
@@ -423,7 +447,14 @@ int main(int argc, char **argv) {
                 ca.note_bytes += note_len;
 
                 // Lookup dense name ID and set in country bitset
-                uint32_t nid = get_or_insert_name_id(n_hash);
+                uint32_t l1_idx = n_hash & 2047;
+                uint32_t nid;
+                if (l1_names[l1_idx].hash == n_hash && l1_names[l1_idx].nid != 0) {
+                    nid = l1_names[l1_idx].nid;
+                } else {
+                    nid = get_or_insert_name_id(n_hash);
+                    l1_names[l1_idx] = {n_hash, nid};
+                }
                 uint32_t word_idx = nid / 64;
                 uint64_t bit_mask = 1ULL << (nid % 64);
                 uint64_t old_val = g_country_bitsets[cid][word_idx].load(std::memory_order_relaxed);
