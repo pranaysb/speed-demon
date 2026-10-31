@@ -10,7 +10,6 @@
 #include <vector>
 #include <string>
 #include <thread>
-#include <chrono>
 
 #if defined(__linux__)
 #include <malloc.h>
@@ -93,8 +92,6 @@ int main(int argc, char **argv) {
         }
     }
 
-    auto t0 = std::chrono::high_resolution_clock::now();
-
     
     // 1. Load regions.csv using mmap & 3-letter hash
     char regions_path[1024];
@@ -111,7 +108,6 @@ int main(int argc, char **argv) {
 
     std::vector<uint16_t> region_to_cid(1000005, 0);
 
-    // 26*26*26 lookup table for 3-letter uppercase country codes
     uint16_t code3_to_cid[26 * 26 * 26];
     memset(code3_to_cid, 0, sizeof(code3_to_cid));
 
@@ -136,7 +132,7 @@ int main(int argc, char **argv) {
 
     const uint8_t *rp = rdata;
     const uint8_t *rend = rdata + rsize;
-    while (rp < rend && *rp != '\n') rp++; // skip header
+    while (rp < rend && *rp != '\n') rp++;
     if (rp < rend) rp++;
 
     while (rp < rend) {
@@ -162,7 +158,6 @@ int main(int argc, char **argv) {
     char records_path[1024];
     snprintf(records_path, sizeof(records_path), "%s/records.csv", data_dir);
 
-    auto t_reg = std::chrono::high_resolution_clock::now();
     int fd = open(records_path, O_RDONLY);
     if (fd < 0) { perror("open records"); return 1; }
 
@@ -176,6 +171,7 @@ int main(int argc, char **argv) {
         close(fd);
         return 1;
     }
+    madvise((void *)data, file_size, MADV_SEQUENTIAL);
 
     unsigned int num_threads = std::thread::hardware_concurrency();
     if (num_threads == 0) num_threads = 4;
@@ -268,14 +264,24 @@ int main(int argc, char **argv) {
                             p++;
                         }
                     }
+                    if (p < end && *p == ',') p++;
                 } else {
-                    while (p < end && *p != ',') {
-                        n_hash = (n_hash ^ *p) * 0x100000001b3ULL;
-                        name_len++;
-                        p++;
+                    const uint8_t *nc = (const uint8_t *)memchr(p, ',', end - p);
+                    if (nc) {
+                        name_len = nc - p;
+                        for (size_t i = 0; i < name_len; i++) {
+                            n_hash = (n_hash ^ p[i]) * 0x100000001b3ULL;
+                        }
+                        p = nc + 1;
+                    } else {
+                        while (p < end && *p != ',') {
+                            n_hash = (n_hash ^ *p) * 0x100000001b3ULL;
+                            name_len++;
+                            p++;
+                        }
+                        if (p < end && *p == ',') p++;
                     }
                 }
-                if (p < end && *p == ',') p++;
                 n_hash ^= name_len;
 
                 // 3. note
@@ -296,13 +302,20 @@ int main(int argc, char **argv) {
                             p++;
                         }
                     }
+                    if (p < end && *p == ',') p++;
                 } else {
-                    while (p < end && *p != ',') {
-                        note_len++;
-                        p++;
+                    const uint8_t *nc = (const uint8_t *)memchr(p, ',', end - p);
+                    if (nc) {
+                        note_len = nc - p;
+                        p = nc + 1;
+                    } else {
+                        while (p < end && *p != ',') {
+                            note_len++;
+                            p++;
+                        }
+                        if (p < end && *p == ',') p++;
                     }
                 }
-                if (p < end && *p == ',') p++;
 
                 // 4. region_id
                 uint32_t reg_id = 0;
@@ -357,72 +370,76 @@ int main(int argc, char **argv) {
             }
         });
     }
-
     for (auto &w : workers) w.join();
     workers.clear();
 
-    madvise((void *)data, file_size, MADV_DONTNEED); munmap((void *)data, file_size);
+    madvise((void *)data, file_size, MADV_DONTNEED);
+    munmap((void *)data, file_size);
+#if defined(__linux__)
+    posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED);
+#endif
     close(fd);
 
-    auto t_parse = std::chrono::high_resolution_clock::now();
-    // 3. Merge aggregates across threads in parallel
+    // Merge country aggregates across threads
     std::vector<FinalCountryAgg> final_aggs(num_countries);
     for (size_t c = 0; c < num_countries; c++) {
         final_aggs[c].key = country_names[c];
     }
 
+    std::vector<std::vector<uint64_t>> country_all_hashes(num_countries);
+    for (size_t c = 0; c < num_countries; c++) {
+        size_t tot_h = 0;
+        for (unsigned int t = 0; t < num_threads; t++) {
+            tot_h += thread_aggs[t][c].name_hashes.size();
+        }
+        country_all_hashes[c].reserve(tot_h);
+        for (unsigned int t = 0; t < num_threads; t++) {
+            auto &ca = thread_aggs[t][c];
+            FinalCountryAgg &fa = final_aggs[c];
+            fa.count += ca.count;
+            fa.id_sum += ca.id_sum;
+            fa.amount_sum += ca.amount_sum;
+            if (ca.has_amount) {
+                if (fa.count == ca.count) {
+                    fa.amount_min = ca.amount_min;
+                    fa.amount_max = ca.amount_max;
+                } else {
+                    if (ca.amount_min < fa.amount_min) fa.amount_min = ca.amount_min;
+                    if (ca.amount_max > fa.amount_max) fa.amount_max = ca.amount_max;
+                }
+            }
+            fa.name_bytes += ca.name_bytes;
+            fa.note_bytes += ca.note_bytes;
+            country_all_hashes[c].insert(country_all_hashes[c].end(), ca.name_hashes.begin(), ca.name_hashes.end());
+            ca.name_hashes.clear();
+            ca.name_hashes.shrink_to_fit();
+        }
+    }
+
     for (unsigned int t = 0; t < num_threads; t++) {
-        workers.emplace_back([t, num_threads, num_countries, &final_aggs, &thread_aggs]() {
+        workers.emplace_back([t, num_threads, num_countries, &country_all_hashes, &final_aggs]() {
             for (size_t c = t; c < num_countries; c += num_threads) {
-                FinalCountryAgg &fa = final_aggs[c];
-                std::vector<uint64_t> all_hashes;
-                size_t total_h = 0;
-                for (size_t thr = 0; thr < thread_aggs.size(); thr++) {
-                    total_h += thread_aggs[thr][c].name_hashes.size();
+                auto &vec = country_all_hashes[c];
+                if (vec.empty()) {
+                    final_aggs[c].names_distinct = 0;
+                    continue;
                 }
-                all_hashes.reserve(total_h);
-
-                for (size_t thr = 0; thr < thread_aggs.size(); thr++) {
-                    auto &ca = thread_aggs[thr][c];
-                    if (ca.count == 0) continue;
-                    fa.count += ca.count;
-                    fa.id_sum += ca.id_sum;
-                    fa.amount_sum += ca.amount_sum;
-                    fa.name_bytes += ca.name_bytes;
-                    fa.note_bytes += ca.note_bytes;
-
-                    if (fa.count == ca.count) {
-                        fa.amount_min = ca.amount_min;
-                        fa.amount_max = ca.amount_max;
-                    } else {
-                        if (ca.amount_min < fa.amount_min) fa.amount_min = ca.amount_min;
-                        if (ca.amount_max > fa.amount_max) fa.amount_max = ca.amount_max;
-                    }
-                    all_hashes.insert(all_hashes.end(), ca.name_hashes.begin(), ca.name_hashes.end());
-                    ca.name_hashes.clear();
-                    ca.name_hashes.shrink_to_fit();
+                std::sort(vec.begin(), vec.end());
+                size_t d = 1;
+                for (size_t i = 1; i < vec.size(); i++) {
+                    if (vec[i] != vec[i - 1]) d++;
                 }
-
-                if (!all_hashes.empty()) {
-                    std::sort(all_hashes.begin(), all_hashes.end());
-                    fa.names_distinct = std::unique(all_hashes.begin(), all_hashes.end()) - all_hashes.begin();
-                }
+                final_aggs[c].names_distinct = d;
+                vec.clear();
+                vec.shrink_to_fit();
             }
         });
     }
     for (auto &w : workers) w.join();
     workers.clear();
 
-    auto t_merge = std::chrono::high_resolution_clock::now();
-    // Sort countries by key in byte order
-    std::vector<size_t> sorted_cids;
-    for (size_t c = 0; c < num_countries; c++) {
-        if (final_aggs[c].count > 0) {
-            sorted_cids.push_back(c);
-        }
-    }
-    std::sort(sorted_cids.begin(), sorted_cids.end(), [&](size_t a, size_t b) {
-        return final_aggs[a].key < final_aggs[b].key;
+    std::sort(final_aggs.begin(), final_aggs.end(), [](const FinalCountryAgg &a, const FinalCountryAgg &b) {
+        return a.key < b.key;
     });
 
     mkdir(out_dir, 0777);
@@ -430,14 +447,13 @@ int main(int argc, char **argv) {
     snprintf(out_path, sizeof(out_path), "%s/aggregates.txt", out_dir);
 
     FILE *out = fopen(out_path, "wb");
-    if (!out) { perror("fopen out"); return 1; }
     char *out_buf = (char *)malloc(1024 * 1024);
     setvbuf(out, out_buf, _IOFBF, 1024 * 1024);
 
-    char line[512];
-    for (size_t cid : sorted_cids) {
-        const auto &fa = final_aggs[cid];
-        char *p = line;
+    char line_buf[512];
+    for (const auto &fa : final_aggs) {
+        if (fa.count == 0) continue;
+        char *p = line_buf;
         memcpy(p, fa.key.data(), fa.key.size()); p += fa.key.size(); *p++ = ' ';
         p = fast_u64(p, fa.count); *p++ = ' ';
         p = fast_u64(p, fa.id_sum); *p++ = ' ';
@@ -447,12 +463,10 @@ int main(int argc, char **argv) {
         p = fast_u64(p, fa.names_distinct); *p++ = ' ';
         p = fast_u64(p, fa.name_bytes); *p++ = ' ';
         p = fast_u64(p, fa.note_bytes); *p++ = '\n';
-        fwrite(line, 1, p - line, out);
+        fwrite(line_buf, 1, p - line_buf, out);
     }
     fclose(out);
     free(out_buf);
 
-    auto t1 = std::chrono::high_resolution_clock::now();
-    // Completed in single pass
     return 0;
 }
