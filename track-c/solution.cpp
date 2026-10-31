@@ -10,6 +10,7 @@
 #include <vector>
 #include <string>
 #include <thread>
+#include <chrono>
 
 #if defined(__linux__)
 #include <malloc.h>
@@ -52,7 +53,7 @@ static inline char* fast_u64(char *p, uint64_t v) {
     return p;
 }
 
-struct CountryMetrics {
+struct ThreadCountryAgg {
     uint64_t count = 0;
     uint64_t id_sum = 0;
     int64_t amount_sum = 0;
@@ -61,7 +62,19 @@ struct CountryMetrics {
     bool has_amount = false;
     uint64_t name_bytes = 0;
     uint64_t note_bytes = 0;
-    uint32_t names_distinct = 0;
+    std::vector<uint64_t> name_hashes;
+};
+
+struct FinalCountryAgg {
+    std::string key;
+    uint64_t count = 0;
+    uint64_t id_sum = 0;
+    int64_t amount_sum = 0;
+    int64_t amount_min = 0;
+    int64_t amount_max = 0;
+    uint64_t names_distinct = 0;
+    uint64_t name_bytes = 0;
+    uint64_t note_bytes = 0;
 };
 
 int main(int argc, char **argv) {
@@ -80,64 +93,76 @@ int main(int argc, char **argv) {
         }
     }
 
-    // 1. Load regions.csv
+    auto t0 = std::chrono::high_resolution_clock::now();
+
+    
+    // 1. Load regions.csv using mmap & 3-letter hash
     char regions_path[1024];
     snprintf(regions_path, sizeof(regions_path), "%s/regions.csv", data_dir);
-
-    FILE *rf = fopen(regions_path, "rb");
-    if (!rf) { perror("regions"); return 1; }
-
-    char line_buf[256];
-    if (!fgets(line_buf, sizeof(line_buf), rf)) { fclose(rf); return 1; }
+    int rfd = open(regions_path, O_RDONLY);
+    if (rfd < 0) { perror("open regions"); return 1; }
+    struct stat rst; fstat(rfd, &rst);
+    size_t rsize = rst.st_size;
+    const uint8_t *rdata = (const uint8_t *)mmap(NULL, rsize, PROT_READ, MAP_SHARED, rfd, 0);
+    close(rfd);
 
     std::vector<std::string> country_names;
     country_names.push_back("_UNMATCHED"); // index 0
 
-    std::vector<uint8_t> region_to_cid(1000005, 0);
+    std::vector<uint16_t> region_to_cid(1000005, 0);
 
-    struct CountryEntry { char code[8]; uint8_t cid; };
-    std::vector<CountryEntry> country_table;
+    // 26*26*26 lookup table for 3-letter uppercase country codes
+    uint16_t code3_to_cid[26 * 26 * 26];
+    memset(code3_to_cid, 0, sizeof(code3_to_cid));
 
-    auto get_or_add_country = [&](const char *c_str, size_t len) -> uint8_t {
-        for (const auto &ce : country_table) {
-            if (strncmp(ce.code, c_str, len) == 0 && ce.code[len] == 0) return ce.cid;
+    auto get_or_add_code3 = [&](const uint8_t *p, size_t len) -> uint16_t {
+        if (len == 3 && p[0] >= "A"[0] && p[0] <= "Z"[0] &&
+                        p[1] >= "A"[0] && p[1] <= "Z"[0] &&
+                        p[2] >= "A"[0] && p[2] <= "Z"[0]) {
+            uint32_t idx = (p[0] - "A"[0]) * 676 + (p[1] - "A"[0]) * 26 + (p[2] - "A"[0]);
+            if (code3_to_cid[idx] != 0) return code3_to_cid[idx];
+            uint16_t cid = (uint16_t)country_names.size();
+            country_names.push_back(std::string((const char *)p, len));
+            code3_to_cid[idx] = cid;
+            return cid;
         }
-        uint8_t cid = (uint8_t)country_names.size();
-        std::string s(c_str, len);
-        country_names.push_back(s);
-        CountryEntry ce;
-        memset(ce.code, 0, sizeof(ce.code));
-        memcpy(ce.code, c_str, len);
-        ce.cid = cid;
-        country_table.push_back(ce);
+        for (size_t c = 0; c < country_names.size(); c++) {
+            if (country_names[c].size() == len && memcmp(country_names[c].data(), p, len) == 0) return (uint16_t)c;
+        }
+        uint16_t cid = (uint16_t)country_names.size();
+        country_names.push_back(std::string((const char *)p, len));
         return cid;
     };
 
-    while (fgets(line_buf, sizeof(line_buf), rf)) {
-        char *p = line_buf;
-        uint32_t reg_id = 0;
-        while (*p >= '0' && *p <= '9') {
-            reg_id = reg_id * 10 + (*p - '0');
-            p++;
-        }
-        if (*p == ',') p++;
-        char *country_start = p;
-        while (*p && *p != '\r' && *p != '\n') p++;
-        size_t c_len = p - country_start;
+    const uint8_t *rp = rdata;
+    const uint8_t *rend = rdata + rsize;
+    while (rp < rend && *rp != "\n"[0]) rp++; // skip header
+    if (rp < rend) rp++;
 
-        uint8_t cid = get_or_add_country(country_start, c_len);
-        if (reg_id < region_to_cid.size()) {
-            region_to_cid[reg_id] = cid;
+    while (rp < rend) {
+        uint32_t reg_id = 0;
+        while (rp < rend && *rp >= "0"[0] && *rp <= "9"[0]) {
+            reg_id = reg_id * 10 + (*rp - "0"[0]);
+            rp++;
         }
+        if (rp < rend && *rp == ","[0]) rp++;
+        const uint8_t *cs = rp;
+        while (rp < rend && *rp != "\r"[0] && *rp != "\n"[0]) rp++;
+        size_t clen = rp - cs;
+        if (rp < rend && *rp == "\r"[0]) rp++;
+        if (rp < rend && *rp == "\n"[0]) rp++;
+        uint16_t cid = get_or_add_code3(cs, clen);
+        if (reg_id < region_to_cid.size()) region_to_cid[reg_id] = cid;
     }
-    fclose(rf);
+    munmap((void *)rdata, rsize);
 
     size_t num_countries = country_names.size();
 
-    // 2. Open and map records.csv
+    // 2. Map records.csv
     char records_path[1024];
     snprintf(records_path, sizeof(records_path), "%s/records.csv", data_dir);
 
+    auto t_reg = std::chrono::high_resolution_clock::now();
     int fd = open(records_path, O_RDONLY);
     if (fd < 0) { perror("open records"); return 1; }
 
@@ -146,8 +171,11 @@ int main(int argc, char **argv) {
     size_t file_size = st.st_size;
 
     const uint8_t *data = (const uint8_t *)mmap(NULL, file_size, PROT_READ, MAP_SHARED, fd, 0);
-    if (data == MAP_FAILED) { perror("mmap records"); close(fd); return 1; }
-    madvise((void *)data, file_size, MADV_SEQUENTIAL);
+    if (data == MAP_FAILED) {
+        perror("mmap records");
+        close(fd);
+        return 1;
+    }
 
     unsigned int num_threads = std::thread::hardware_concurrency();
     if (num_threads == 0) num_threads = 4;
@@ -190,27 +218,21 @@ int main(int argc, char **argv) {
     }
     chunk_ends[num_threads - 1] = data + file_size;
 
-    // PASS 1: All metrics + 64-bit FNV-1a hashes for Batch 1 (countries 0 .. half_c)
-    size_t half_c = num_countries / 2;
-
-    struct ThreadBatchState {
-        std::vector<CountryMetrics> aggs;
-        std::vector<std::vector<uint64_t>> country_hashes;
-    };
-    std::vector<ThreadBatchState> t_state1(num_threads);
+    std::vector<std::vector<ThreadCountryAgg>> thread_aggs(num_threads);
     for (unsigned int t = 0; t < num_threads; t++) {
-        t_state1[t].aggs.resize(num_countries);
-        t_state1[t].country_hashes.resize(half_c);
+        thread_aggs[t].resize(num_countries);
+        for (size_t c = 0; c < num_countries; c++) {
+            thread_aggs[t][c].name_hashes.reserve(256);
+        }
     }
 
     std::vector<std::thread> workers;
 
     for (unsigned int t = 0; t < num_threads; t++) {
-        workers.emplace_back([t, &t_state1, &chunk_starts, &chunk_ends, &region_to_cid, half_c]() {
+        workers.emplace_back([t, &thread_aggs, &chunk_starts, &chunk_ends, &region_to_cid]() {
             const uint8_t *p = chunk_starts[t];
             const uint8_t *end = chunk_ends[t];
-            auto &aggs = t_state1[t].aggs;
-            auto &c_hashes = t_state1[t].country_hashes;
+            auto &aggs = thread_aggs[t];
             size_t reg_limit = region_to_cid.size();
 
             while (p < end) {
@@ -225,7 +247,7 @@ int main(int argc, char **argv) {
                 }
                 if (p < end && *p == ',') p++;
 
-                // 2. name with 64-bit FNV-1a (100% collision free)
+                // 2. name
                 uint64_t name_len = 0;
                 uint64_t n_hash = 0xa0761d6478bd642fULL;
                 if (p < end && *p == '"') {
@@ -254,6 +276,7 @@ int main(int argc, char **argv) {
                     }
                 }
                 if (p < end && *p == ',') p++;
+                n_hash ^= name_len;
 
                 // 3. note
                 uint64_t note_len = 0;
@@ -274,9 +297,10 @@ int main(int argc, char **argv) {
                         }
                     }
                 } else {
-                    const uint8_t *ns = p;
-                    while (p < end && *p != ',') p++;
-                    note_len = p - ns;
+                    while (p < end && *p != ',') {
+                        note_len++;
+                        p++;
+                    }
                 }
                 if (p < end && *p == ',') p++;
 
@@ -289,8 +313,11 @@ int main(int argc, char **argv) {
                 if (p < end && *p == ',') p++;
 
                 // 5. amount
-                bool neg = false;
-                if (p < end && *p == '-') { neg = true; p++; }
+                int64_t sign = 1;
+                if (p < end && *p == '-') {
+                    sign = -1;
+                    p++;
+                }
                 int64_t whole = 0;
                 while (p < end && *p >= '0' && *p <= '9') {
                     whole = whole * 10 + (*p - '0');
@@ -301,263 +328,131 @@ int main(int argc, char **argv) {
                 if (p < end && *p >= '0' && *p <= '9') {
                     frac = (*p - '0') * 10;
                     p++;
-                }
-                if (p < end && *p >= '0' && *p <= '9') {
-                    frac += (*p - '0');
-                    p++;
-                }
-                int64_t cents = whole * 100 + frac;
-                if (neg) cents = -cents;
-
-                while (p < end && *p != '\n') p++;
-                if (p < end && *p == '\n') p++;
-
-                uint8_t cid = (reg_id < reg_limit) ? region_to_cid[reg_id] : 0;
-                auto &agg = aggs[cid];
-                agg.count++;
-                agg.id_sum += rec_id;
-                agg.name_bytes += name_len;
-                agg.note_bytes += note_len;
-                agg.amount_sum += cents;
-                if (!agg.has_amount) {
-                    agg.amount_min = cents;
-                    agg.amount_max = cents;
-                    agg.has_amount = true;
-                } else {
-                    if (cents < agg.amount_min) agg.amount_min = cents;
-                    if (cents > agg.amount_max) agg.amount_max = cents;
-                }
-
-                if (cid < half_c) {
-                    c_hashes[cid].push_back(n_hash);
-                }
-            }
-        });
-    }
-    for (auto &w : workers) w.join();
-    workers.clear();
-
-    // Consolidate non-distinct metrics into final table
-    std::vector<CountryMetrics> final_metrics(num_countries);
-    for (size_t c = 0; c < num_countries; c++) {
-        bool has_amt = false;
-        for (unsigned int t = 0; t < num_threads; t++) {
-            const auto &agg = t_state1[t].aggs[c];
-            final_metrics[c].count += agg.count;
-            final_metrics[c].id_sum += agg.id_sum;
-            final_metrics[c].amount_sum += agg.amount_sum;
-            final_metrics[c].name_bytes += agg.name_bytes;
-            final_metrics[c].note_bytes += agg.note_bytes;
-            if (agg.has_amount) {
-                if (!has_amt) {
-                    final_metrics[c].amount_min = agg.amount_min;
-                    final_metrics[c].amount_max = agg.amount_max;
-                    has_amt = true;
-                } else {
-                    if (agg.amount_min < final_metrics[c].amount_min) final_metrics[c].amount_min = agg.amount_min;
-                    if (agg.amount_max > final_metrics[c].amount_max) final_metrics[c].amount_max = agg.amount_max;
-                }
-            }
-        }
-    }
-
-    // Sort and distinct count Batch 1
-    size_t chunk1 = (half_c + num_threads - 1) / num_threads;
-    for (unsigned int t = 0; t < num_threads; t++) {
-        size_t c_start = t * chunk1;
-        size_t c_end = std::min(c_start + chunk1, half_c);
-        if (c_start >= c_end) continue;
-
-        workers.emplace_back([c_start, c_end, &final_metrics, &t_state1, num_threads]() {
-            std::vector<uint64_t> merged;
-            for (size_t c = c_start; c < c_end; c++) {
-                merged.clear();
-                size_t tot = 0;
-                for (unsigned int tid = 0; tid < num_threads; tid++) tot += t_state1[tid].country_hashes[c].size();
-                merged.reserve(tot);
-                for (unsigned int tid = 0; tid < num_threads; tid++) {
-                    const auto &h = t_state1[tid].country_hashes[c];
-                    merged.insert(merged.end(), h.begin(), h.end());
-                }
-                std::sort(merged.begin(), merged.end());
-                uint32_t distinct = 0;
-                for (size_t i = 0; i < merged.size(); i++) {
-                    if (i == 0 || merged[i] != merged[i - 1]) distinct++;
-                }
-                final_metrics[c].names_distinct = distinct;
-            }
-        });
-    }
-    for (auto &w : workers) w.join();
-    workers.clear();
-
-    // Free Batch 1 memory immediately
-    t_state1.clear(); t_state1.shrink_to_fit();
-
-    // PASS 2: Collect and count Batch 2 (half_c .. num_countries)
-    std::vector<std::vector<std::vector<uint64_t>>> t_hashes2(num_threads);
-    for (unsigned int t = 0; t < num_threads; t++) {
-        t_hashes2[t].resize(num_countries - half_c);
-    }
-
-    for (unsigned int t = 0; t < num_threads; t++) {
-        workers.emplace_back([t, &t_hashes2, &chunk_starts, &chunk_ends, &region_to_cid, half_c]() {
-            const uint8_t *p = chunk_starts[t];
-            const uint8_t *end = chunk_ends[t];
-            auto &c_hashes = t_hashes2[t];
-            size_t reg_limit = region_to_cid.size();
-
-            while (p < end) {
-                if (end - p >= 3 && p[0] == 0xEF && p[1] == 0xBB && p[2] == 0xBF) p += 3;
-                if (p >= end) break;
-
-                // 1. skip id
-                while (p < end && *p >= '0' && *p <= '9') p++;
-                if (p < end && *p == ',') p++;
-
-                // 2. name
-                uint64_t n_hash = 0xa0761d6478bd642fULL;
-                if (p < end && *p == '"') {
-                    p++;
-                    while (p < end) {
-                        if (*p == '"') {
-                            if (p + 1 < end && *(p + 1) == '"') {
-                                n_hash = (n_hash ^ '"') * 0x100000001b3ULL;
-                                p += 2;
-                            } else {
-                                p++;
-                                break;
-                            }
-                        } else {
-                            n_hash = (n_hash ^ *p) * 0x100000001b3ULL;
-                            p++;
-                        }
-                    }
-                } else {
-                    while (p < end && *p != ',') {
-                        n_hash = (n_hash ^ *p) * 0x100000001b3ULL;
+                    if (p < end && *p >= '0' && *p <= '9') {
+                        frac += (*p - '0');
                         p++;
                     }
                 }
-                if (p < end && *p == ',') p++;
+                int64_t cents = sign * (whole * 100 + frac);
 
-                // 3. skip note
-                if (p < end && *p == '"') {
-                    p++;
-                    while (p < end) {
-                        if (*p == '"') {
-                            if (p + 1 < end && *(p + 1) == '"') {
-                                p += 2;
-                            } else {
-                                p++;
-                                break;
-                            }
-                        } else p++;
-                    }
-                } else {
-                    while (p < end && *p != ',') p++;
-                }
-                if (p < end && *p == ',') p++;
-
-                // 4. region_id
-                uint32_t reg_id = 0;
-                while (p < end && *p >= '0' && *p <= '9') {
-                    reg_id = reg_id * 10 + (*p - '0');
-                    p++;
-                }
-
-                // 5. skip amount
-                while (p < end && *p != '\n') p++;
+                if (p < end && *p == '\r') p++;
                 if (p < end && *p == '\n') p++;
 
-                uint8_t cid = (reg_id < reg_limit) ? region_to_cid[reg_id] : 0;
-                if (cid >= half_c) {
-                    c_hashes[cid - half_c].push_back(n_hash);
+                uint16_t cid = (reg_id < reg_limit) ? region_to_cid[reg_id] : 0;
+                ThreadCountryAgg &ca = aggs[cid];
+                ca.count++;
+                ca.id_sum += rec_id;
+                ca.amount_sum += cents;
+                if (!ca.has_amount) {
+                    ca.amount_min = cents;
+                    ca.amount_max = cents;
+                    ca.has_amount = true;
+                } else {
+                    if (cents < ca.amount_min) ca.amount_min = cents;
+                    if (cents > ca.amount_max) ca.amount_max = cents;
                 }
+                ca.name_bytes += name_len;
+                ca.note_bytes += note_len;
+                ca.name_hashes.push_back(n_hash);
             }
         });
     }
+
     for (auto &w : workers) w.join();
     workers.clear();
 
-    munmap((void *)data, file_size);
-#if defined(__linux__)
-    posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED);
-#endif
+    madvise((void *)data, file_size, MADV_DONTNEED); munmap((void *)data, file_size);
     close(fd);
 
-    // Sort and distinct count Batch 2
-    size_t rem = num_countries - half_c;
-    size_t chunk2 = (rem + num_threads - 1) / num_threads;
-    for (unsigned int t = 0; t < num_threads; t++) {
-        size_t c_start = t * chunk2;
-        size_t c_end = std::min(c_start + chunk2, rem);
-        if (c_start >= c_end) continue;
+    auto t_parse = std::chrono::high_resolution_clock::now();
+    // 3. Merge aggregates across threads in parallel
+    std::vector<FinalCountryAgg> final_aggs(num_countries);
+    for (size_t c = 0; c < num_countries; c++) {
+        final_aggs[c].key = country_names[c];
+    }
 
-        workers.emplace_back([c_start, c_end, &final_metrics, &t_hashes2, half_c, num_threads]() {
-            std::vector<uint64_t> merged;
-            for (size_t c = c_start; c < c_end; c++) {
-                merged.clear();
-                size_t tot = 0;
-                for (unsigned int tid = 0; tid < num_threads; tid++) tot += t_hashes2[tid][c].size();
-                merged.reserve(tot);
-                for (unsigned int tid = 0; tid < num_threads; tid++) {
-                    const auto &h = t_hashes2[tid][c];
-                    merged.insert(merged.end(), h.begin(), h.end());
+    for (unsigned int t = 0; t < num_threads; t++) {
+        workers.emplace_back([t, num_threads, num_countries, &final_aggs, &thread_aggs]() {
+            for (size_t c = t; c < num_countries; c += num_threads) {
+                FinalCountryAgg &fa = final_aggs[c];
+                std::vector<uint64_t> all_hashes;
+                size_t total_h = 0;
+                for (size_t thr = 0; thr < thread_aggs.size(); thr++) {
+                    total_h += thread_aggs[thr][c].name_hashes.size();
                 }
-                std::sort(merged.begin(), merged.end());
-                uint32_t distinct = 0;
-                for (size_t i = 0; i < merged.size(); i++) {
-                    if (i == 0 || merged[i] != merged[i - 1]) distinct++;
+                all_hashes.reserve(total_h);
+
+                for (size_t thr = 0; thr < thread_aggs.size(); thr++) {
+                    auto &ca = thread_aggs[thr][c];
+                    if (ca.count == 0) continue;
+                    fa.count += ca.count;
+                    fa.id_sum += ca.id_sum;
+                    fa.amount_sum += ca.amount_sum;
+                    fa.name_bytes += ca.name_bytes;
+                    fa.note_bytes += ca.note_bytes;
+
+                    if (fa.count == ca.count) {
+                        fa.amount_min = ca.amount_min;
+                        fa.amount_max = ca.amount_max;
+                    } else {
+                        if (ca.amount_min < fa.amount_min) fa.amount_min = ca.amount_min;
+                        if (ca.amount_max > fa.amount_max) fa.amount_max = ca.amount_max;
+                    }
+                    all_hashes.insert(all_hashes.end(), ca.name_hashes.begin(), ca.name_hashes.end());
+                    ca.name_hashes.clear();
+                    ca.name_hashes.shrink_to_fit();
                 }
-                final_metrics[half_c + c].names_distinct = distinct;
+
+                if (!all_hashes.empty()) {
+                    std::sort(all_hashes.begin(), all_hashes.end());
+                    fa.names_distinct = std::unique(all_hashes.begin(), all_hashes.end()) - all_hashes.begin();
+                }
             }
         });
     }
     for (auto &w : workers) w.join();
     workers.clear();
-    t_hashes2.clear(); t_hashes2.shrink_to_fit();
 
-    // Sort countries lexicographically
-    struct OutputRow {
-        std::string key;
-        CountryMetrics m;
-    };
-    std::vector<OutputRow> rows(num_countries);
+    auto t_merge = std::chrono::high_resolution_clock::now();
+    // Sort countries by key in byte order
+    std::vector<size_t> sorted_cids;
     for (size_t c = 0; c < num_countries; c++) {
-        rows[c] = {country_names[c], final_metrics[c]};
+        if (final_aggs[c].count > 0) {
+            sorted_cids.push_back(c);
+        }
     }
-    std::sort(rows.begin(), rows.end(), [](const OutputRow &a, const OutputRow &b) {
-        return a.key < b.key;
+    std::sort(sorted_cids.begin(), sorted_cids.end(), [&](size_t a, size_t b) {
+        return final_aggs[a].key < final_aggs[b].key;
     });
 
-    // Write output
     mkdir(out_dir, 0777);
     char out_path[1024];
     snprintf(out_path, sizeof(out_path), "%s/aggregates.txt", out_dir);
 
     FILE *out = fopen(out_path, "wb");
+    if (!out) { perror("fopen out"); return 1; }
     char *out_buf = (char *)malloc(1024 * 1024);
     setvbuf(out, out_buf, _IOFBF, 1024 * 1024);
 
-    char out_line[512];
-    for (const auto &row : rows) {
-        if (row.m.count == 0) continue;
-        char *p = out_line;
-        memcpy(p, row.key.data(), row.key.size()); p += row.key.size(); *p++ = ' ';
-        p = fast_u64(p, row.m.count); *p++ = ' ';
-        p = fast_u64(p, row.m.id_sum); *p++ = ' ';
-        p = format_cents(p, row.m.amount_sum); *p++ = ' ';
-        p = format_cents(p, row.m.amount_min); *p++ = ' ';
-        p = format_cents(p, row.m.amount_max); *p++ = ' ';
-        p = fast_u64(p, row.m.names_distinct); *p++ = ' ';
-        p = fast_u64(p, row.m.name_bytes); *p++ = ' ';
-        p = fast_u64(p, row.m.note_bytes); *p++ = '\n';
-
-        fwrite(out_line, 1, p - out_line, out);
+    char line[512];
+    for (size_t cid : sorted_cids) {
+        const auto &fa = final_aggs[cid];
+        char *p = line;
+        memcpy(p, fa.key.data(), fa.key.size()); p += fa.key.size(); *p++ = ' ';
+        p = fast_u64(p, fa.count); *p++ = ' ';
+        p = fast_u64(p, fa.id_sum); *p++ = ' ';
+        p = format_cents(p, fa.amount_sum); *p++ = ' ';
+        p = format_cents(p, fa.amount_min); *p++ = ' ';
+        p = format_cents(p, fa.amount_max); *p++ = ' ';
+        p = fast_u64(p, fa.names_distinct); *p++ = ' ';
+        p = fast_u64(p, fa.name_bytes); *p++ = ' ';
+        p = fast_u64(p, fa.note_bytes); *p++ = '\n';
+        fwrite(line, 1, p - line, out);
     }
     fclose(out);
     free(out_buf);
 
+    auto t1 = std::chrono::high_resolution_clock::now();
+    // Completed in single pass
     return 0;
 }

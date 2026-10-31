@@ -171,7 +171,7 @@ int main(int argc, char **argv) {
         f_edges[f_cur[u]++] = {v, w};
         b_edges[b_cur[v]++] = {u, w};
     }
-    munmap((void *)g_data, g_size);
+    madvise((void *)g_data, g_size, MADV_DONTNEED); munmap((void *)g_data, g_size);
 #if defined(__linux__)
     posix_fadvise(g_fd, 0, 0, POSIX_FADV_DONTNEED);
 #endif
@@ -228,7 +228,7 @@ int main(int argc, char **argv) {
         if (p < q_end && *p == '\n') p++;
         queries.push_back(q_item);
     }
-    munmap((void *)q_data, q_size);
+    madvise((void *)q_data, q_size, MADV_DONTNEED); munmap((void *)q_data, q_size);
 #if defined(__linux__)
     posix_fadvise(q_fd, 0, 0, POSIX_FADV_DONTNEED);
 #endif
@@ -237,7 +237,7 @@ int main(int argc, char **argv) {
     size_t num_queries = queries.size();
     std::vector<int64_t> answers(num_queries, -1);
 
-    unsigned int num_threads = 4;
+    unsigned int num_threads = std::min(12u, std::max(4u, std::thread::hardware_concurrency()));
     std::vector<std::thread> workers;
     size_t chunk_size = (num_queries + num_threads - 1) / num_threads;
 
@@ -354,6 +354,7 @@ int main(int argc, char **argv) {
     fclose(out);
     free(out_buf);
 
-    
+    double ms = std::chrono::duration<double, std::milli>(std::chrono::high_resolution_clock::now() - t_start).count();
+    printf("Track D Bidi Total Time: %.2f ms\n", ms);
     return 0;
 }
