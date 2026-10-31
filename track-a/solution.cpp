@@ -11,6 +11,7 @@
 #include <string>
 #include <thread>
 #include <mutex>
+#include <atomic>
 
 #if defined(__linux__)
 #include <malloc.h>
@@ -364,7 +365,7 @@ int main(int argc, char **argv) {
     std::atomic<int> next_hour{0};
 
     for (unsigned int t = 0; t < num_threads; t++) {
-        workers.emplace_back([&, num_eps]() {
+        workers.emplace_back([&]() {
             char line_buf[512];
             int h;
             while ((h = next_hour.fetch_add(1, std::memory_order_relaxed)) < 72) {
