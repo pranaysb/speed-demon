@@ -10,6 +10,8 @@
 #include <vector>
 #include <string>
 #include <thread>
+#include <atomic>
+#include <chrono>
 
 #if defined(__linux__)
 #include <malloc.h>
@@ -61,7 +63,6 @@ struct ThreadCountryAgg {
     bool has_amount = false;
     uint64_t name_bytes = 0;
     uint64_t note_bytes = 0;
-    std::vector<uint64_t> name_hashes;
 };
 
 struct FinalCountryAgg {
@@ -92,8 +93,7 @@ int main(int argc, char **argv) {
         }
     }
 
-    
-    // 1. Load regions.csv using mmap & 3-letter hash
+    // 1. Load regions.csv
     char regions_path[1024];
     snprintf(regions_path, sizeof(regions_path), "%s/regions.csv", data_dir);
     int rfd = open(regions_path, O_RDONLY);
@@ -107,7 +107,6 @@ int main(int argc, char **argv) {
     country_names.push_back("_UNMATCHED"); // index 0
 
     std::vector<uint16_t> region_to_cid(1000005, 0);
-
     uint16_t code3_to_cid[26 * 26 * 26];
     memset(code3_to_cid, 0, sizeof(code3_to_cid));
 
@@ -166,13 +165,6 @@ int main(int argc, char **argv) {
     size_t file_size = st.st_size;
 
     const uint8_t *data = (const uint8_t *)mmap(NULL, file_size, PROT_READ, MAP_SHARED, fd, 0);
-    if (data == MAP_FAILED) {
-        perror("mmap records");
-        close(fd);
-        return 1;
-    }
-    madvise((void *)data, file_size, MADV_SEQUENTIAL);
-
     unsigned int num_threads = std::thread::hardware_concurrency();
     if (num_threads == 0) num_threads = 4;
     if (num_threads > 12) num_threads = 12;
@@ -214,21 +206,32 @@ int main(int argc, char **argv) {
     }
     chunk_ends[num_threads - 1] = data + file_size;
 
-    std::vector<std::vector<ThreadCountryAgg>> thread_aggs(num_threads);
+    std::vector<std::vector<ThreadCountryAgg>> thread_aggs(num_threads, std::vector<ThreadCountryAgg>(num_countries));
+    std::vector<uint64_t *> thread_raw_hashes(num_threads);
+    std::vector<uint64_t *> thread_sorted_hashes(num_threads);
+    std::vector<size_t> thread_hash_bytes(num_threads);
+    std::vector<size_t> thread_recs(num_threads);
+    std::vector<std::vector<uint32_t>> thread_c_counts(num_threads, std::vector<uint32_t>(num_countries, 0));
+    std::vector<std::vector<uint32_t>> thread_c_offsets(num_threads, std::vector<uint32_t>(num_countries + 1, 0));
+
     for (unsigned int t = 0; t < num_threads; t++) {
-        thread_aggs[t].resize(num_countries);
-        for (size_t c = 0; c < num_countries; c++) {
-            thread_aggs[t][c].name_hashes.reserve(256);
-        }
+        size_t chunk_bytes = chunk_ends[t] - chunk_starts[t];
+        size_t max_recs = (chunk_bytes / 30) + 10000;
+        thread_hash_bytes[t] = max_recs * sizeof(uint64_t);
+        thread_raw_hashes[t] = (uint64_t *)mmap(NULL, thread_hash_bytes[t], PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
     }
 
     std::vector<std::thread> workers;
 
     for (unsigned int t = 0; t < num_threads; t++) {
-        workers.emplace_back([t, &thread_aggs, &chunk_starts, &chunk_ends, &region_to_cid]() {
+        workers.emplace_back([t, &thread_aggs, &thread_raw_hashes, &thread_sorted_hashes,
+                              &thread_hash_bytes, &thread_recs, &thread_c_counts, &thread_c_offsets,
+                              &chunk_starts, &chunk_ends, &region_to_cid, num_countries]() {
             const uint8_t *p = chunk_starts[t];
             const uint8_t *end = chunk_ends[t];
             auto &aggs = thread_aggs[t];
+            auto &counts = thread_c_counts[t];
+            uint64_t *hptr = thread_raw_hashes[t];
             size_t reg_limit = region_to_cid.size();
 
             while (p < end) {
@@ -366,18 +369,38 @@ int main(int argc, char **argv) {
                 }
                 ca.name_bytes += name_len;
                 ca.note_bytes += note_len;
-                ca.name_hashes.push_back(n_hash);
+
+                counts[cid]++;
+                *hptr++ = ((uint64_t)cid << 56) | (n_hash & 0x00FFFFFFFFFFFFFFULL);
             }
+            size_t n = hptr - thread_raw_hashes[t];
+            thread_recs[t] = n;
+
+            // Local counting sort by cid
+            uint64_t *sorted_part = (uint64_t *)mmap(NULL, thread_hash_bytes[t], PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+            thread_sorted_hashes[t] = sorted_part;
+
+            auto &offsets = thread_c_offsets[t];
+            for (size_t c = 0; c < num_countries; c++) {
+                offsets[c + 1] = offsets[c] + counts[c];
+            }
+            std::vector<uint32_t> cur = offsets;
+
+            const uint64_t *src = thread_raw_hashes[t];
+            for (size_t i = 0; i < n; i++) {
+                uint8_t cid = src[i] >> 56;
+                uint32_t pos = cur[cid]++;
+                sorted_part[pos] = src[i] & 0x00FFFFFFFFFFFFFFULL;
+            }
+
+            munmap(thread_raw_hashes[t], thread_hash_bytes[t]);
+            thread_raw_hashes[t] = nullptr;
         });
     }
     for (auto &w : workers) w.join();
     workers.clear();
 
-    madvise((void *)data, file_size, MADV_DONTNEED);
     munmap((void *)data, file_size);
-#if defined(__linux__)
-    posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED);
-#endif
     close(fd);
 
     // Merge country aggregates across threads
@@ -386,12 +409,18 @@ int main(int argc, char **argv) {
         final_aggs[c].key = country_names[c];
     }
 
+    std::atomic<size_t> next_country{0};
+
     for (unsigned int t = 0; t < num_threads; t++) {
-        workers.emplace_back([t, num_threads, num_countries, &final_aggs, &thread_aggs]() {
-            std::vector<uint64_t> all_hashes;
-            for (size_t c = t; c < num_countries; c += num_threads) {
+        workers.emplace_back([&next_country, num_countries, num_threads, &final_aggs, &thread_aggs,
+                              &thread_sorted_hashes, &thread_c_counts, &thread_c_offsets]() {
+            std::vector<uint64_t> country_hashes;
+            country_hashes.reserve(131072);
+
+            size_t c;
+            while ((c = next_country.fetch_add(1)) < num_countries) {
                 FinalCountryAgg &fa = final_aggs[c];
-                all_hashes.clear();
+                country_hashes.clear();
 
                 for (unsigned int thr = 0; thr < num_threads; thr++) {
                     auto &ca = thread_aggs[thr][c];
@@ -399,29 +428,27 @@ int main(int argc, char **argv) {
                     fa.count += ca.count;
                     fa.id_sum += ca.id_sum;
                     fa.amount_sum += ca.amount_sum;
-                    if (ca.has_amount) {
-                        if (fa.count == ca.count) {
-                            fa.amount_min = ca.amount_min;
-                            fa.amount_max = ca.amount_max;
-                        } else {
-                            if (ca.amount_min < fa.amount_min) fa.amount_min = ca.amount_min;
-                            if (ca.amount_max > fa.amount_max) fa.amount_max = ca.amount_max;
-                        }
+                    if (fa.count == ca.count) {
+                        fa.amount_min = ca.amount_min;
+                        fa.amount_max = ca.amount_max;
+                    } else {
+                        if (ca.amount_min < fa.amount_min) fa.amount_min = ca.amount_min;
+                        if (ca.amount_max > fa.amount_max) fa.amount_max = ca.amount_max;
                     }
                     fa.name_bytes += ca.name_bytes;
                     fa.note_bytes += ca.note_bytes;
-                    all_hashes.insert(all_hashes.end(), ca.name_hashes.begin(), ca.name_hashes.end());
-                    ca.name_hashes.clear();
-                    ca.name_hashes.shrink_to_fit();
+
+                    uint32_t cnt = thread_c_counts[thr][c];
+                    if (cnt > 0) {
+                        uint32_t off = thread_c_offsets[thr][c];
+                        const uint64_t *p = &thread_sorted_hashes[thr][off];
+                        country_hashes.insert(country_hashes.end(), p, p + cnt);
+                    }
                 }
 
-                if (!all_hashes.empty()) {
-                    std::sort(all_hashes.begin(), all_hashes.end());
-                    size_t d = 1;
-                    for (size_t i = 1; i < all_hashes.size(); i++) {
-                        if (all_hashes[i] != all_hashes[i - 1]) d++;
-                    }
-                    fa.names_distinct = d;
+                if (!country_hashes.empty()) {
+                    std::sort(country_hashes.begin(), country_hashes.end());
+                    fa.names_distinct = std::unique(country_hashes.begin(), country_hashes.end()) - country_hashes.begin();
                 }
             }
         });
@@ -429,6 +456,11 @@ int main(int argc, char **argv) {
     for (auto &w : workers) w.join();
     workers.clear();
 
+    for (unsigned int t = 0; t < num_threads; t++) {
+        munmap(thread_sorted_hashes[t], thread_hash_bytes[t]);
+    }
+
+    // Sort final output by country code
     std::sort(final_aggs.begin(), final_aggs.end(), [](const FinalCountryAgg &a, const FinalCountryAgg &b) {
         return a.key < b.key;
     });
@@ -437,26 +469,27 @@ int main(int argc, char **argv) {
     char out_path[1024];
     snprintf(out_path, sizeof(out_path), "%s/aggregates.txt", out_dir);
 
-    FILE *out = fopen(out_path, "wb");
+    FILE *fout = fopen(out_path, "wb");
     char *out_buf = (char *)malloc(1024 * 1024);
-    setvbuf(out, out_buf, _IOFBF, 1024 * 1024);
+    setvbuf(fout, out_buf, _IOFBF, 1024 * 1024);
 
     char line_buf[512];
     for (const auto &fa : final_aggs) {
         if (fa.count == 0) continue;
-        char *p = line_buf;
-        memcpy(p, fa.key.data(), fa.key.size()); p += fa.key.size(); *p++ = ' ';
-        p = fast_u64(p, fa.count); *p++ = ' ';
-        p = fast_u64(p, fa.id_sum); *p++ = ' ';
-        p = format_cents(p, fa.amount_sum); *p++ = ' ';
-        p = format_cents(p, fa.amount_min); *p++ = ' ';
-        p = format_cents(p, fa.amount_max); *p++ = ' ';
-        p = fast_u64(p, fa.names_distinct); *p++ = ' ';
-        p = fast_u64(p, fa.name_bytes); *p++ = ' ';
-        p = fast_u64(p, fa.note_bytes); *p++ = '\n';
-        fwrite(line_buf, 1, p - line_buf, out);
+        char *cur = line_buf;
+        memcpy(cur, fa.key.data(), fa.key.size()); cur += fa.key.size();
+        *cur++ = ' ';
+        cur = fast_u64(cur, fa.count); *cur++ = ' ';
+        cur = fast_u64(cur, fa.id_sum); *cur++ = ' ';
+        cur = format_cents(cur, fa.amount_sum); *cur++ = ' ';
+        cur = format_cents(cur, fa.amount_min); *cur++ = ' ';
+        cur = format_cents(cur, fa.amount_max); *cur++ = ' ';
+        cur = fast_u64(cur, fa.names_distinct); *cur++ = ' ';
+        cur = fast_u64(cur, fa.name_bytes); *cur++ = ' ';
+        cur = fast_u64(cur, fa.note_bytes); *cur++ = '\n';
+        fwrite(line_buf, 1, cur - line_buf, fout);
     }
-    fclose(out);
+    fclose(fout);
     free(out_buf);
 
     return 0;
