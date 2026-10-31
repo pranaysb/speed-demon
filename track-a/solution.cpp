@@ -28,16 +28,16 @@ static void init_hour_strings() {
 
 static inline int parse_hour_idx(const uint8_t *ts) {
     int day_offset = 0;
-    if (ts[5] == "1"[0] && ts[6] == "0"[0]) {
-        if (ts[8] == "3"[0]) {
-            if (ts[9] == "0"[0]) day_offset = 0;
+    if (ts[5] == '1' && ts[6] == '0') {
+        if (ts[8] == '3') {
+            if (ts[9] == '0') day_offset = 0;
             else day_offset = 1;
         }
     } else {
-        if (ts[9] == "1"[0]) day_offset = 2;
+        if (ts[9] == '1') day_offset = 2;
         else day_offset = 3;
     }
-    int hh = (ts[11] - "0"[0]) * 10 + (ts[12] - "0"[0]);
+    int hh = (ts[11] - '0') * 10 + (ts[12] - '0');
     return day_offset * 24 + hh - 18;
 }
 
@@ -113,17 +113,17 @@ struct RawItem {
 #pragma pack(pop)
 
 static inline char* fast_u32(char *p, uint32_t v) {
-    if (v == 0) { *p++ = "0"[0]; return p; }
+    if (v == 0) { *p++ = '0'; return p; }
     char buf[12]; int i = 0;
-    while (v > 0) { buf[i++] = (v % 10) + "0"[0]; v /= 10; }
+    while (v > 0) { buf[i++] = (v % 10) + '0'; v /= 10; }
     while (i > 0) *p++ = buf[--i];
     return p;
 }
 
 static inline char* fast_u64(char *p, uint64_t v) {
-    if (v == 0) { *p++ = "0"[0]; return p; }
+    if (v == 0) { *p++ = '0'; return p; }
     char buf[24]; int i = 0;
-    while (v > 0) { buf[i++] = (v % 10) + "0"[0]; v /= 10; }
+    while (v > 0) { buf[i++] = (v % 10) + '0'; v /= 10; }
     while (i > 0) *p++ = buf[--i];
     return p;
 }
@@ -208,22 +208,22 @@ int main(int argc, char **argv) {
                 }
 
                 p += 28;
-                while (*p != " "[0]) p++;
+                while (*p != ' ') p++;
                 p++;
 
                 const char *ep_start = (const char *)p;
-                while (*p != " "[0]) p++;
+                while (*p != ' ') p++;
                 size_t ep_len = (const char *)p - ep_start;
                 p++;
 
                 uint16_t ep_id = get_or_insert_endpoint(ep_start, ep_len);
 
-                uint8_t is_err = (p[0] == "5"[0]) ? 1 : 0;
+                uint8_t is_err = (p[0] == '5') ? 1 : 0;
                 p += 4;
 
                 uint32_t lat = 0;
-                while (*p >= "0"[0] && *p <= "9"[0]) {
-                    lat = lat * 10 + (*p - "0"[0]);
+                while (*p >= '0' && *p <= '9') {
+                    lat = lat * 10 + (*p - '0');
                     p++;
                 }
                 while (*p != "\n"[0]) p++;
@@ -367,14 +367,14 @@ int main(int argc, char **argv) {
                     uint64_t ppm = (uint64_t)errs * 1000000ULL / n;
 
                     char *cur = line_buf;
-                    memcpy(cur, h_str, 20); cur += 20; *cur++ = " "[0];
+                    memcpy(cur, h_str, 20); cur += 20; *cur++ = ' ';
                     const std::string &ep_s = g_endpoint_strings[ep_id];
-                    memcpy(cur, ep_s.data(), ep_s.size()); cur += ep_s.size(); *cur++ = " "[0];
-                    cur = fast_u32(cur, n); *cur++ = " "[0];
-                    cur = fast_u32(cur, p50); *cur++ = " "[0];
-                    cur = fast_u32(cur, p95); *cur++ = " "[0];
-                    cur = fast_u32(cur, p99); *cur++ = " "[0];
-                    cur = fast_u32(cur, errs); *cur++ = " "[0];
+                    memcpy(cur, ep_s.data(), ep_s.size()); cur += ep_s.size(); *cur++ = ' ';
+                    cur = fast_u32(cur, n); *cur++ = ' ';
+                    cur = fast_u32(cur, p50); *cur++ = ' ';
+                    cur = fast_u32(cur, p95); *cur++ = ' ';
+                    cur = fast_u32(cur, p99); *cur++ = ' ';
+                    cur = fast_u32(cur, errs); *cur++ = ' ';
                     cur = fast_u64(cur, ppm); *cur++ = "\n"[0];
                     out_str.append(line_buf, cur - line_buf);
                 }

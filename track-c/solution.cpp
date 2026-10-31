@@ -116,10 +116,10 @@ int main(int argc, char **argv) {
     memset(code3_to_cid, 0, sizeof(code3_to_cid));
 
     auto get_or_add_code3 = [&](const uint8_t *p, size_t len) -> uint16_t {
-        if (len == 3 && p[0] >= "A"[0] && p[0] <= "Z"[0] &&
-                        p[1] >= "A"[0] && p[1] <= "Z"[0] &&
-                        p[2] >= "A"[0] && p[2] <= "Z"[0]) {
-            uint32_t idx = (p[0] - "A"[0]) * 676 + (p[1] - "A"[0]) * 26 + (p[2] - "A"[0]);
+        if (len == 3 && p[0] >= 'A' && p[0] <= 'Z' &&
+                        p[1] >= 'A' && p[1] <= 'Z' &&
+                        p[2] >= 'A' && p[2] <= 'Z') {
+            uint32_t idx = (p[0] - 'A') * 676 + (p[1] - 'A') * 26 + (p[2] - 'A');
             if (code3_to_cid[idx] != 0) return code3_to_cid[idx];
             uint16_t cid = (uint16_t)country_names.size();
             country_names.push_back(std::string((const char *)p, len));
@@ -141,11 +141,11 @@ int main(int argc, char **argv) {
 
     while (rp < rend) {
         uint32_t reg_id = 0;
-        while (rp < rend && *rp >= "0"[0] && *rp <= "9"[0]) {
-            reg_id = reg_id * 10 + (*rp - "0"[0]);
+        while (rp < rend && *rp >= '0' && *rp <= '9') {
+            reg_id = reg_id * 10 + (*rp - '0');
             rp++;
         }
-        if (rp < rend && *rp == ","[0]) rp++;
+        if (rp < rend && *rp == ',') rp++;
         const uint8_t *cs = rp;
         while (rp < rend && *rp != "\r"[0] && *rp != "\n"[0]) rp++;
         size_t clen = rp - cs;

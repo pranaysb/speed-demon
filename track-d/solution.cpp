@@ -129,8 +129,8 @@ struct DistMap {
 
 static inline const uint8_t *fast_parse_u32(const uint8_t *p, uint32_t *val) {
     uint32_t v = 0;
-    while (*p >= "0"[0] && *p <= "9"[0]) {
-        v = v * 10 + (*p - "0"[0]);
+    while (*p >= '0' && *p <= '9') {
+        v = v * 10 + (*p - '0');
         p++;
     }
     *val = v;
@@ -138,10 +138,10 @@ static inline const uint8_t *fast_parse_u32(const uint8_t *p, uint32_t *val) {
 }
 
 static inline char* fast_i64(char *p, int64_t v) {
-    if (v < 0) { *p++ = "-"[0]; v = -v; }
-    if (v == 0) { *p++ = "0"[0]; return p; }
+    if (v < 0) { *p++ = '-'; v = -v; }
+    if (v == 0) { *p++ = '0'; return p; }
     char buf[24]; int i = 0;
-    while (v > 0) { buf[i++] = (v % 10) + "0"[0]; v /= 10; }
+    while (v > 0) { buf[i++] = (v % 10) + '0'; v /= 10; }
     while (i > 0) *p++ = buf[--i];
     return p;
 }
@@ -264,10 +264,10 @@ int main(int argc, char **argv) {
     queries.reserve(2048);
     p = q_data; const uint8_t *q_end = q_data + q_size;
     while (p < q_end) {
-        while (p < q_end && (*p == " "[0] || *p == "\n"[0] || *p == "\r"[0])) p++;
+        while (p < q_end && (*p == ' ' || *p == "\n"[0] || *p == "\r"[0])) p++;
         if (p >= q_end) break;
         Query q_item;
-        p = fast_parse_u32(p, &q_item.s); while (p < q_end && *p == " "[0]) p++;
+        p = fast_parse_u32(p, &q_item.s); while (p < q_end && *p == ' ') p++;
         p = fast_parse_u32(p, &q_item.t); while (p < q_end && *p != "\n"[0]) p++;
         if (p < q_end && *p == "\n"[0]) p++;
         queries.push_back(q_item);
