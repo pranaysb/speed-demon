@@ -58,7 +58,7 @@ static constexpr size_t EP_MAP_CAP = 16384;
 static constexpr size_t EP_MAP_MASK = EP_MAP_CAP - 1;
 static EndpointEntry g_ep_map[EP_MAP_CAP];
 
-static inline uint64_t fast_hash(const char *p, size_t len) {
+[[maybe_unused]] static inline uint64_t fast_hash(const char *p, size_t len) {
     uint64_t h = 0xcbf29ce484222325ULL ^ len;
     size_t i = 0;
     while (i + 8 <= len) {
@@ -252,12 +252,24 @@ int main(int argc, char **argv) {
                 else { while (p < end && *p != ' ') p++; if (p < end) p++; }
 
                 const char *ep_start = (const char *)p;
-                const char *sp = (const char *)memchr(ep_start, ' ', end - (const uint8_t *)ep_start);
-                if (!sp) break;
-                size_t ep_len = sp - ep_start;
-                p = (const uint8_t *)sp + 1;
-
-                uint64_t h = fast_hash(ep_start, ep_len);
+                uint64_t h = 0xcbf29ce484222325ULL;
+                while (p + 8 <= end) {
+                    uint64_t w;
+                    memcpy(&w, p, 8);
+                    uint64_t x = w ^ 0x2020202020202020ULL;
+                    uint64_t has_sp = (x - 0x0101010101010101ULL) & ~x & 0x8080808080808080ULL;
+                    if (has_sp) {
+                        int pos = __builtin_ctzll(has_sp) >> 3;
+                        for (int i = 0; i < pos; i++) h = (h ^ (uint8_t)p[i]) * 0x100000001b3ULL;
+                        p += pos;
+                        break;
+                    }
+                    h = (h ^ w) * 0x100000001b3ULL;
+                    p += 8;
+                }
+                size_t ep_len = (const char *)p - ep_start;
+                h ^= ep_len;
+                p++; // skip space
                 size_t c_idx = h & 4095;
                 uint16_t ep_id;
                 if (__builtin_expect(l1_cache[c_idx].hash == h && l1_cache[c_idx].len == ep_len, 1)) {
