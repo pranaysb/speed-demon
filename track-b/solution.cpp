@@ -202,36 +202,57 @@ static inline size_t diff_raw(const uint32_t *a, size_t na, const uint32_t *b, s
 static inline bool check_phrase(const uint8_t *tp, size_t len, const std::vector<std::string_view> &terms) {
     const uint8_t *tend = tp + len;
     size_t k = terms.size();
-    size_t match_idx = 0;
+    char first_ch = terms[0][0];
+    size_t first_len = terms[0].size();
 
-    while (tp < tend) {
-        while (tp < tend && !is_alnum_tab[*tp]) tp++;
-        if (tp >= tend) break;
+    const uint8_t *cur = tp;
+    while (cur < tend) {
+        while (cur < tend && to_lower_tab[*cur] != (uint8_t)first_ch) cur++;
+        if (cur >= tend) break;
 
-        const uint8_t *tok_start = tp;
-        while (tp < tend && is_alnum_tab[*tp]) tp++;
-        size_t tok_len = tp - tok_start;
+        if (cur > tp && is_alnum_tab[*(cur - 1)]) {
+            cur++;
+            continue;
+        }
 
-        auto match_term = [&](size_t idx) {
-            const auto &term = terms[idx];
-            if (term.size() != tok_len) return false;
-            for (size_t i = 0; i < tok_len; i++) {
-                if (to_lower_tab[tok_start[i]] != (uint8_t)term[i]) return false;
-            }
-            return true;
-        };
+        if (cur + first_len > tend || (cur + first_len < tend && is_alnum_tab[*(cur + first_len)])) {
+            cur++;
+            continue;
+        }
 
-        if (match_term(match_idx)) {
-            match_idx++;
-            if (match_idx == k) return true;
-        } else {
-            if (match_term(0)) {
-                match_idx = 1;
-                if (match_idx == k) return true;
-            } else {
-                match_idx = 0;
+        bool match_first = true;
+        for (size_t i = 0; i < first_len; i++) {
+            if (to_lower_tab[cur[i]] != (uint8_t)terms[0][i]) {
+                match_first = false;
+                break;
             }
         }
+        if (!match_first) {
+            cur++;
+            continue;
+        }
+
+        const uint8_t *sub_p = cur + first_len;
+        bool all_matched = true;
+        for (size_t m = 1; m < k; m++) {
+            while (sub_p < tend && !is_alnum_tab[*sub_p]) sub_p++;
+            if (sub_p >= tend) { all_matched = false; break; }
+            size_t tlen = terms[m].size();
+            if (sub_p + tlen > tend || (sub_p + tlen < tend && is_alnum_tab[*(sub_p + tlen)])) {
+                all_matched = false;
+                break;
+            }
+            for (size_t i = 0; i < tlen; i++) {
+                if (to_lower_tab[sub_p[i]] != (uint8_t)terms[m][i]) {
+                    all_matched = false;
+                    break;
+                }
+            }
+            if (!all_matched) break;
+            sub_p += tlen;
+        }
+        if (all_matched) return true;
+        cur += first_len;
     }
     return false;
 }
