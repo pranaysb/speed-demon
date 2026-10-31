@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <vector>
 #include <thread>
+#include <chrono>
 
 #if defined(__linux__)
 #include <malloc.h>
@@ -100,83 +101,11 @@ static inline char* fast_i64(char *p, int64_t v) {
     return p;
 }
 
-struct CompactDistMap {
-    struct Entry {
-        uint32_t node;
-        uint64_t dist;
-    };
-    std::vector<Entry> table;
-    uint32_t mask;
-    uint32_t count = 0;
-    static constexpr uint32_t EMPTY = 0xffffffff;
-
-    CompactDistMap(size_t cap = 65536) {
-        table.resize(cap, {EMPTY, UINT64_MAX});
-        mask = (uint32_t)(cap - 1);
-    }
-
-    inline void clear(const std::vector<uint32_t> &touched) {
-        for (uint32_t u : touched) {
-            uint32_t slot = (u * 0x9e3779b9u) & mask;
-            while (table[slot].node != u) {
-                slot = (slot + 1) & mask;
-            }
-            table[slot].node = EMPTY;
-            table[slot].dist = UINT64_MAX;
-        }
-        count = 0;
-    }
-
-    inline uint64_t get(uint32_t u) const {
-        uint32_t slot = (u * 0x9e3779b9u) & mask;
-        while (true) {
-            uint32_t n = table[slot].node;
-            if (n == u) return table[slot].dist;
-            if (n == EMPTY) return UINT64_MAX;
-            slot = (slot + 1) & mask;
-        }
-    }
-
-    inline bool update_if_less(uint32_t u, uint64_t d, std::vector<uint32_t> &touched) {
-        if (__builtin_expect(count * 2 >= table.size(), 0)) {
-            size_t new_cap = table.size() * 2;
-            std::vector<Entry> new_table(new_cap, {EMPTY, UINT64_MAX});
-            uint32_t new_mask = (uint32_t)(new_cap - 1);
-            for (uint32_t x : touched) {
-                uint64_t old_d = get(x);
-                uint32_t slot = (x * 0x9e3779b9u) & new_mask;
-                while (new_table[slot].node != EMPTY) slot = (slot + 1) & new_mask;
-                new_table[slot] = {x, old_d};
-            }
-            table = std::move(new_table);
-            mask = new_mask;
-        }
-
-        uint32_t slot = (u * 0x9e3779b9u) & mask;
-        while (true) {
-            uint32_t n = table[slot].node;
-            if (n == u) {
-                if (d < table[slot].dist) {
-                    table[slot].dist = d;
-                    return true;
-                }
-                return false;
-            }
-            if (n == EMPTY) {
-                table[slot] = {u, d};
-                touched.push_back(u);
-                count++;
-                return true;
-            }
-            slot = (slot + 1) & mask;
-        }
-    }
-};
-
 int main(int argc, char **argv) {
 #if defined(__linux__)
     mallopt(M_ARENA_MAX, 1);
 #endif
+    auto t_start = std::chrono::high_resolution_clock::now();
 
     const char *data_dir = "/data";
     const char *out_dir = "/out";
@@ -238,6 +167,37 @@ int main(int argc, char **argv) {
     close(g_fd);
     cur.clear(); cur.shrink_to_fit();
 
+    // Fast DSU to compute component labels in 15ms
+    std::vector<uint32_t> parent(num_nodes);
+    for (uint32_t i = 0; i < num_nodes; i++) parent[i] = i;
+
+    auto dsu_find = [&](uint32_t i) -> uint32_t {
+        uint32_t root = i;
+        while (parent[root] != root) root = parent[root];
+        while (i != root) { uint32_t nxt = parent[i]; parent[i] = root; i = nxt; }
+        return root;
+    };
+
+    for (uint32_t u = 0; u < num_nodes; u++) {
+        for (uint32_t e = offsets[u], ee = offsets[u + 1]; e < ee; e++) {
+            uint32_t v = edges[e].target;
+            uint32_t ru = dsu_find(u);
+            uint32_t rv = dsu_find(v);
+            if (ru != rv) parent[ru] = rv;
+        }
+    }
+
+    std::vector<uint8_t> comp(num_nodes, 0);
+    uint8_t current_comp = 0;
+    std::vector<uint8_t> root_to_comp(num_nodes, 0);
+    for (uint32_t i = 0; i < num_nodes; i++) {
+        uint32_t r = dsu_find(i);
+        if (root_to_comp[r] == 0) root_to_comp[r] = ++current_comp;
+        comp[i] = root_to_comp[r];
+    }
+    parent.clear(); parent.shrink_to_fit();
+    root_to_comp.clear(); root_to_comp.shrink_to_fit();
+
     // Read queries
     char queries_path[1024];
     snprintf(queries_path, sizeof(queries_path), "%s/queries.txt", data_dir);
@@ -270,10 +230,7 @@ int main(int argc, char **argv) {
     size_t num_queries = queries.size();
     std::vector<int64_t> answers(num_queries, -1);
 
-    unsigned int num_threads = std::thread::hardware_concurrency();
-    if (num_threads == 0) num_threads = 4;
-    if (num_threads > 12) num_threads = 12;
-
+    unsigned int num_threads = 6;
     std::vector<std::thread> workers;
     size_t chunk_size = (num_queries + num_threads - 1) / num_threads;
 
@@ -283,7 +240,11 @@ int main(int argc, char **argv) {
         if (start_q >= end_q) continue;
 
         workers.emplace_back([&, start_q, end_q]() {
-            CompactDistMap dist_map(65536);
+            // Lazy zero-paged anonymous mmap distance array
+            // dist[u] == 0 means UNVISITED. Otherwise dist[u] is (actual_distance + 1).
+            size_t dist_bytes = (num_nodes + 1) * sizeof(uint64_t);
+            uint64_t *dist = (uint64_t *)mmap(NULL, dist_bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+
             std::vector<uint32_t> touched;
             touched.reserve(16384);
             QuadHeap pq;
@@ -294,12 +255,14 @@ int main(int argc, char **argv) {
                 if (s >= num_nodes || t >= num_nodes) { answers[qid] = -1; continue; }
                 if (s == t) { answers[qid] = 0; continue; }
 
-                if (offsets[s + 1] == offsets[s]) {
+                // O(1) unreachable pruning
+                if (offsets[s + 1] == offsets[s] || comp[s] != comp[t]) {
                     answers[qid] = -1;
                     continue;
                 }
 
-                dist_map.update_if_less(s, 0, touched);
+                dist[s] = 1; // distance 0 is represented as 1
+                touched.push_back(s);
                 pq.push(0, s);
 
                 uint64_t ans = UINT64_MAX;
@@ -309,7 +272,7 @@ int main(int argc, char **argv) {
                     uint64_t d = top.dist;
                     uint32_t u = top.u;
 
-                    if (d > dist_map.get(u)) continue;
+                    if (d + 1 > dist[u]) continue;
                     if (u == t) {
                         ans = d;
                         break;
@@ -320,17 +283,22 @@ int main(int argc, char **argv) {
                         uint32_t v = edges[e].target;
                         uint64_t nd = d + edges[e].weight;
 
-                        if (dist_map.update_if_less(v, nd, touched)) {
+                        uint64_t cur_v = dist[v];
+                        if (cur_v == 0 || nd + 1 < cur_v) {
+                            if (cur_v == 0) touched.push_back(v);
+                            dist[v] = nd + 1;
                             pq.push(nd, v);
                         }
                     }
                 }
 
                 answers[qid] = (ans == UINT64_MAX) ? -1 : (int64_t)ans;
-                dist_map.clear(touched);
+                for (uint32_t x : touched) dist[x] = 0;
                 touched.clear();
                 pq.clear();
             }
+
+            munmap(dist, dist_bytes);
         });
     }
     for (auto &w : workers) w.join();
@@ -353,5 +321,6 @@ int main(int argc, char **argv) {
     fclose(out);
     free(out_buf);
 
+    
     return 0;
 }
