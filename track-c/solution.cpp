@@ -12,6 +12,28 @@
 #include <thread>
 #include <atomic>
 
+#if defined(__x86_64__) || defined(_M_X64)
+#include <immintrin.h>
+static inline uint32_t crc32c_u64(uint32_t crc, uint64_t v) { return (uint32_t)_mm_crc32_u64(crc, v); }
+static inline uint32_t crc32c_u8(uint32_t crc, uint8_t v) { return (uint32_t)_mm_crc32_u8(crc, v); }
+#elif defined(__aarch64__) || defined(_M_ARM64)
+#include <arm_acle.h>
+static inline uint32_t crc32c_u64(uint32_t crc, uint64_t v) { return __crc32cd(crc, v); }
+static inline uint32_t crc32c_u8(uint32_t crc, uint8_t v) { return __crc32cb(crc, v); }
+#else
+static inline uint32_t crc32c_u64(uint32_t crc, uint64_t v) {
+    for (int i = 0; i < 8; i++) {
+        uint8_t b = (v >> (i * 8)) & 0xFF;
+        crc = (crc >> 8) ^ (0x82F63B78 * ((crc ^ b) & 1)); // placeholder fallback
+    }
+    return crc;
+}
+static inline uint32_t crc32c_u8(uint32_t crc, uint8_t v) {
+    return (crc >> 8) ^ (0x82F63B78 * ((crc ^ v) & 1));
+}
+#endif
+
+
 #if defined(__linux__)
 #include <malloc.h>
 #endif
@@ -120,43 +142,30 @@ struct FinalCountryAgg {
     uint64_t note_bytes = 0;
 };
 
-// Global lock-free hash table to assign dense name_id (0..262,143)
-static constexpr size_t NAME_MAP_CAP = 524288; // 512K slots
+// Global lock-free 64-bit table to assign dense name_id (high 32: CRC32-C, low 32: name_id)
+static constexpr size_t NAME_MAP_CAP = 262144; // 256K slots (38% load factor for 100,520 names)
 static constexpr size_t NAME_MAP_MASK = NAME_MAP_CAP - 1;
 
-static std::atomic<uint64_t> g_name_map_keys[NAME_MAP_CAP];
-static std::atomic<uint32_t> g_name_map_vals[NAME_MAP_CAP];
+static std::atomic<uint64_t> g_name_map[NAME_MAP_CAP];
 static std::atomic<uint32_t> g_next_name_id{1}; // 1-based
 
-static inline uint32_t get_or_insert_name_id(uint64_t h) {
-    if (__builtin_expect(h == 0, 0)) h = 0x517cc1b727220a95ULL;
-    size_t idx = h & NAME_MAP_MASK;
+static inline uint32_t get_or_insert_name_id(uint32_t crc) {
+    if (__builtin_expect(crc == 0, 0)) crc = 0x517cc1b7;
+    size_t idx = (size_t)crc & NAME_MAP_MASK;
     while (true) {
-        uint64_t cur = g_name_map_keys[idx].load(std::memory_order_relaxed);
-        if (cur == h) {
-            uint32_t v;
-            while ((v = g_name_map_vals[idx].load(std::memory_order_acquire)) == 0) {
-#if defined(__x86_64__) || defined(_M_X64)
-                _mm_pause();
-#endif
-            }
-            return v;
+        uint64_t entry = g_name_map[idx].load(std::memory_order_relaxed);
+        if ((uint32_t)(entry >> 32) == crc) {
+            return (uint32_t)entry;
         }
-        if (cur == 0) {
+        if (entry == 0) {
+            uint32_t nid = g_next_name_id.fetch_add(1, std::memory_order_relaxed);
+            uint64_t new_entry = ((uint64_t)crc << 32) | nid;
             uint64_t expected = 0;
-            if (g_name_map_keys[idx].compare_exchange_strong(expected, h, std::memory_order_relaxed)) {
-                uint32_t nid = g_next_name_id.fetch_add(1, std::memory_order_relaxed);
-                g_name_map_vals[idx].store(nid, std::memory_order_release);
+            if (g_name_map[idx].compare_exchange_strong(expected, new_entry, std::memory_order_relaxed)) {
                 return nid;
             }
-            if (expected == h) {
-                uint32_t v;
-                while ((v = g_name_map_vals[idx].load(std::memory_order_acquire)) == 0) {
-#if defined(__x86_64__) || defined(_M_X64)
-                    _mm_pause();
-#endif
-                }
-                return v;
+            if ((uint32_t)(expected >> 32) == crc) {
+                return (uint32_t)expected;
             }
         }
         idx = (idx + 1) & NAME_MAP_MASK;
@@ -305,7 +314,7 @@ int main(int argc, char **argv) {
             const uint8_t *end = chunk_ends[t];
             auto &aggs = thread_aggs[t];
             size_t reg_limit = region_to_cid.size();
-            struct L1NameEntry { uint64_t hash; uint32_t nid; uint16_t last_cid; };
+            struct L1NameEntry { uint32_t crc; uint32_t nid; uint16_t last_cid; };
             L1NameEntry l1_names[4096] = {};
 
             while (p < end) {
@@ -322,7 +331,7 @@ int main(int argc, char **argv) {
 
                 // 2. name
                 uint64_t name_len = 0;
-                uint64_t n_hash = 0xa0761d6478bd642fULL;
+                uint32_t n_crc = 0xFFFFFFFF;
                 if (p < end && *p == '"') {
                     p++;
                     while (p < end) {
@@ -334,19 +343,19 @@ int main(int argc, char **argv) {
                         while (rem >= 8) {
                             uint64_t v;
                             memcpy(&v, sp_p, 8);
-                            n_hash = (n_hash ^ v) * 0x517cc1b727220a95ULL;
+                            n_crc = crc32c_u64(n_crc, v);
                             sp_p += 8;
                             rem -= 8;
                         }
                         while (rem > 0) {
-                            n_hash = (n_hash ^ *sp_p) * 0x100000001b3ULL;
+                            n_crc = crc32c_u8(n_crc, *sp_p);
                             sp_p++;
                             rem--;
                         }
                         p = next_q;
                         if (p < end) {
                             if (p + 1 < end && *(p + 1) == '"') {
-                                n_hash = (n_hash ^ '"') * 0x100000001b3ULL;
+                                n_crc = crc32c_u8(n_crc, '"');
                                 name_len++;
                                 p += 2;
                             } else {
@@ -364,20 +373,20 @@ int main(int argc, char **argv) {
                     while (rem >= 8) {
                         uint64_t v;
                         memcpy(&v, sp_p, 8);
-                        n_hash = (n_hash ^ v) * 0x517cc1b727220a95ULL;
+                        n_crc = crc32c_u64(n_crc, v);
                         sp_p += 8;
                         rem -= 8;
                     }
                     while (rem > 0) {
-                        n_hash = (n_hash ^ *sp_p) * 0x100000001b3ULL;
+                        n_crc = crc32c_u8(n_crc, *sp_p);
                         sp_p++;
                         rem--;
                     }
                     p = nc;
                     if (p < end && *p == ',') p++;
                 }
-                n_hash ^= name_len;
-
+                n_crc ^= 0xFFFFFFFF;
+                
                 // 3. note (SIMD accelerated)
                 uint64_t note_len = 0;
                 if (p < end && *p == '"') {
@@ -447,17 +456,17 @@ int main(int argc, char **argv) {
                 ca.note_bytes += note_len;
 
                 // Lookup dense name ID and set in country bitset
-                uint32_t l1_idx = n_hash & 4095;
-                if (__builtin_expect(l1_names[l1_idx].hash == n_hash && l1_names[l1_idx].last_cid == cid, 1)) {
+                uint32_t l1_idx = n_crc & 4095;
+                if (__builtin_expect(l1_names[l1_idx].crc == n_crc && l1_names[l1_idx].last_cid == cid, 1)) {
                     // Already set in this country bitset
                 } else {
                     uint32_t nid;
-                    if (l1_names[l1_idx].hash == n_hash && l1_names[l1_idx].nid != 0) {
+                    if (l1_names[l1_idx].crc == n_crc && l1_names[l1_idx].nid != 0) {
                         nid = l1_names[l1_idx].nid;
                     } else {
-                        nid = get_or_insert_name_id(n_hash);
+                        nid = get_or_insert_name_id(n_crc);
                     }
-                    l1_names[l1_idx] = {n_hash, nid, cid};
+                    l1_names[l1_idx] = {n_crc, nid, cid};
                     uint32_t word_idx = nid / 64;
                     uint64_t bit_mask = 1ULL << (nid % 64);
                     uint64_t old_val = g_country_bitsets[cid][word_idx].load(std::memory_order_relaxed);
