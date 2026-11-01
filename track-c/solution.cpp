@@ -39,6 +39,22 @@ static inline uint32_t crc32c_u8(uint32_t crc, uint8_t v) {
 }
 #endif
 
+// Fast unrolled CRC for contiguous buffer <= 32 bytes
+static inline uint32_t crc32c_buffer_small(const uint8_t *p, size_t len) {
+    uint32_t crc = 0xFFFFFFFF;
+    size_t rem = len;
+    while (rem >= 8) {
+        uint64_t v; memcpy(&v, p, 8);
+        crc = crc32c_u64(crc, v);
+        p += 8; rem -= 8;
+    }
+    while (rem > 0) {
+        crc = crc32c_u8(crc, *p);
+        p++; rem--;
+    }
+    return crc ^ 0xFFFFFFFF;
+}
+
 static inline const uint8_t* find_char_simd(const uint8_t *p, const uint8_t *end, uint8_t target) {
 #if defined(__AVX2__)
     __m256i q256 = _mm256_set1_epi8(target);
@@ -248,6 +264,7 @@ int main(int argc, char **argv) {
     size_t file_size = st.st_size;
 
     const uint8_t *data = (const uint8_t *)mmap(NULL, file_size, PROT_READ, MAP_SHARED, fd, 0);
+
     unsigned int num_threads = std::clamp(std::thread::hardware_concurrency(), 1u, 12u);
 
     std::vector<const uint8_t *> chunk_starts(num_threads);
@@ -295,121 +312,123 @@ int main(int argc, char **argv) {
             auto &aggs = thread_aggs[t];
             size_t reg_limit = region_to_cid.size();
 
-            // 8,192-entry direct-mapped L1 cache (32 KB, fits in 48KB L1D cache)
-            static constexpr size_t L1_CAP = 8192;
+            // 16,384-entry direct-mapped L1 cache (64 KB)
+            static constexpr size_t L1_CAP = 16384;
             static constexpr size_t L1_MASK = L1_CAP - 1;
             uint32_t l1_cache[L1_CAP] = {};
 
             while (p < end) {
-                if (end - p >= 3 && p[0] == 0xEF && p[1] == 0xBB && p[2] == 0xBF) p += 3;
+                if (__builtin_expect(end - p >= 3 && p[0] == 0xEF && p[1] == 0xBB && p[2] == 0xBF, 0)) p += 3;
                 if (p >= end) break;
 
                 // 1. id
-                uint64_t rec_id = 0;
-                while (p < end && *p >= '0' && *p <= '9') {
-                    rec_id = rec_id * 10 + (*p - '0');
-                    p++;
+                uint64_t rec_id = *p++ - '0';
+                while (*p != ',') {
+                    rec_id = rec_id * 10 + (*p++ - '0');
                 }
-                if (p < end && *p == ',') p++;
+                p++; // skip ','
 
                 // 2. name
                 uint64_t name_len = 0;
                 uint32_t n_crc = 0xFFFFFFFF;
-                if (p < end && *p == '"') {
+                if (*p == '"') {
                     p++;
-                    while (p < end) {
-                        const uint8_t *next_q = find_char_simd(p, end, '"');
-                        size_t span = next_q - p;
-                        name_len += span;
-                        size_t rem = span;
-                        const uint8_t *sp_p = p;
-                        while (rem >= 8) {
-                            uint64_t v; memcpy(&v, sp_p, 8);
-                            n_crc = crc32c_u64(n_crc, v);
-                            sp_p += 8; rem -= 8;
-                        }
-                        while (rem > 0) {
-                            n_crc = crc32c_u8(n_crc, *sp_p);
-                            sp_p++; rem--;
-                        }
-                        p = next_q;
-                        if (p < end) {
-                            if (p + 1 < end && *(p + 1) == '"') {
-                                n_crc = crc32c_u8(n_crc, '"');
-                                name_len++;
-                                p += 2;
-                            } else {
-                                p++;
-                                break;
+                    // Fast path: find closing quote
+                    const uint8_t *next_q = find_char_simd(p, end, '"');
+                    if (__builtin_expect(next_q + 1 < end && *(next_q + 1) == ',', 1)) {
+                        // Clean quoted name without escaped quotes!
+                        name_len = next_q - p;
+                        n_crc = crc32c_buffer_small(p, name_len);
+                        p = next_q + 2; // skip quote and comma
+                    } else {
+                        // General case with escaped quotes
+                        uint32_t running_crc = 0xFFFFFFFF;
+                        while (p < end) {
+                            size_t span = next_q - p;
+                            name_len += span;
+                            size_t rem = span;
+                            const uint8_t *sp_p = p;
+                            while (rem >= 8) {
+                                uint64_t v; memcpy(&v, sp_p, 8);
+                                running_crc = crc32c_u64(running_crc, v);
+                                sp_p += 8; rem -= 8;
+                            }
+                            while (rem > 0) {
+                                running_crc = crc32c_u8(running_crc, *sp_p);
+                                sp_p++; rem--;
+                            }
+                            p = next_q;
+                            if (p < end) {
+                                if (p + 1 < end && *(p + 1) == '"') {
+                                    running_crc = crc32c_u8(running_crc, '"');
+                                    name_len++;
+                                    p += 2;
+                                    next_q = find_char_simd(p, end, '"');
+                                } else {
+                                    p++;
+                                    break;
+                                }
                             }
                         }
+                        if (p < end && *p == ',') p++;
+                        n_crc = running_crc ^ 0xFFFFFFFF;
                     }
-                    if (p < end && *p == ',') p++;
                 } else {
                     const uint8_t *nc = find_char_simd(p, end, ',');
                     name_len = nc - p;
-                    size_t rem = name_len;
-                    const uint8_t *sp_p = p;
-                    while (rem >= 8) {
-                        uint64_t v; memcpy(&v, sp_p, 8);
-                        n_crc = crc32c_u64(n_crc, v);
-                        sp_p += 8; rem -= 8;
-                    }
-                    while (rem > 0) {
-                        n_crc = crc32c_u8(n_crc, *sp_p);
-                        sp_p++; rem--;
-                    }
-                    p = nc;
-                    if (p < end && *p == ',') p++;
+                    n_crc = crc32c_buffer_small(p, name_len);
+                    p = nc + 1; // skip comma
                 }
-                n_crc ^= 0xFFFFFFFF;
-                
+
                 // 3. note
                 uint64_t note_len = 0;
-                if (p < end && *p == '"') {
+                if (*p == '"') {
                     p++;
-                    while (p < end) {
-                        const uint8_t *next_q = find_char_simd(p, end, '"');
-                        note_len += (next_q - p);
-                        p = next_q;
-                        if (p < end) {
-                            if (p + 1 < end && *(p + 1) == '"') {
-                                note_len++;
-                                p += 2;
-                            } else {
-                                p++;
-                                break;
+                    const uint8_t *next_q = find_char_simd(p, end, '"');
+                    if (__builtin_expect(next_q + 1 < end && *(next_q + 1) == ',', 1)) {
+                        note_len = next_q - p;
+                        p = next_q + 2;
+                    } else {
+                        while (p < end) {
+                            note_len += (next_q - p);
+                            p = next_q;
+                            if (p < end) {
+                                if (p + 1 < end && *(p + 1) == '"') {
+                                    note_len++;
+                                    p += 2;
+                                    next_q = find_char_simd(p, end, '"');
+                                } else {
+                                    p++;
+                                    break;
+                                }
                             }
                         }
+                        if (p < end && *p == ',') p++;
                     }
-                    if (p < end && *p == ',') p++;
                 } else {
                     const uint8_t *nc = find_char_simd(p, end, ',');
                     note_len = nc - p;
-                    p = nc;
-                    if (p < end && *p == ',') p++;
+                    p = nc + 1;
                 }
 
                 // 4. region_id
-                uint32_t reg_id = 0;
-                while (p < end && *p >= '0' && *p <= '9') {
-                    reg_id = reg_id * 10 + (*p - '0');
-                    p++;
+                uint32_t reg_id = *p++ - '0';
+                while (*p != ',') {
+                    reg_id = reg_id * 10 + (*p++ - '0');
                 }
-                if (p < end && *p == ',') p++;
+                p++; // skip ','
 
                 // 5. amount
                 int64_t sign = 1;
-                if (p < end && *p == '-') {
+                if (*p == '-') {
                     sign = -1;
                     p++;
                 }
-                int64_t whole = 0;
-                while (p < end && *p >= '0' && *p <= '9') {
-                    whole = whole * 10 + (*p - '0');
-                    p++;
+                int64_t whole = *p++ - '0';
+                while (*p != '.') {
+                    whole = whole * 10 + (*p++ - '0');
                 }
-                if (p < end && *p == '.') p++;
+                p++; // skip '.'
                 int64_t cents = sign * (whole * 100 + (p[0] - '0') * 10 + (p[1] - '0'));
                 p += 2;
 
