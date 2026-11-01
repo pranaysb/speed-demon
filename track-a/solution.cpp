@@ -20,43 +20,26 @@
 
 #if defined(__x86_64__) || defined(_M_X64)
 #include <immintrin.h>
-static inline uint64_t fast_crc(const char *p, size_t len) {
-    uint64_t crc = len;
-    size_t i = 0;
-    while (i + 8 <= len) {
-        uint64_t v; memcpy(&v, p + i, 8);
-        crc = _mm_crc32_u64(crc, v);
-        i += 8;
-    }
-    while (i < len) {
-        crc = _mm_crc32_u8((uint32_t)crc, (uint8_t)p[i]);
-        i++;
-    }
-    return crc;
-}
+static inline uint64_t fast_crc_word(uint64_t crc, uint64_t v) { return _mm_crc32_u64(crc, v); }
+static inline uint64_t fast_crc_byte(uint64_t crc, uint8_t b) { return _mm_crc32_u8((uint32_t)crc, b); }
 #elif defined(__aarch64__) || defined(_M_ARM64)
 #include <arm_acle.h>
-static inline uint64_t fast_crc(const char *p, size_t len) {
-    uint64_t crc = len;
-    size_t i = 0;
-    while (i + 8 <= len) {
-        uint64_t v; memcpy(&v, p + i, 8);
-        crc = __crc32d((uint32_t)crc, v);
-        i += 8;
-    }
-    while (i < len) {
-        crc = __crc32b((uint32_t)crc, (uint8_t)p[i]);
-        i++;
-    }
+static inline uint64_t fast_crc_word(uint64_t crc, uint64_t v) { return __crc32d((uint32_t)crc, v); }
+static inline uint64_t fast_crc_byte(uint64_t crc, uint8_t b) { return __crc32b((uint32_t)crc, b); }
+#else
+static inline uint64_t fast_crc_word(uint64_t crc, uint64_t v) {
+    for (int i = 0; i < 8; i++) crc = (crc ^ ((v >> (i * 8)) & 0xFF)) * 0x100000001b3ULL;
     return crc;
 }
-#else
-static inline uint64_t fast_crc(const char *p, size_t len) {
-    uint64_t h = len;
-    for (size_t i = 0; i < len; i++) h = (h ^ (uint8_t)p[i]) * 0x100000001b3ULL;
-    return h;
-}
+static inline uint64_t fast_crc_byte(uint64_t crc, uint8_t b) { return (crc ^ b) * 0x100000001b3ULL; }
 #endif
+
+static inline int find_space_8(uint64_t v) {
+    uint64_t x = v ^ 0x2020202020202020ULL;
+    uint64_t z = (x - 0x0101010101010101ULL) & ~x & 0x8080808080808080ULL;
+    if (z == 0) return -1;
+    return __builtin_ctzll(z) >> 3;
+}
 
 // Base timestamp: 2026-10-30T18:00:00Z -> hour 0
 static inline int parse_hour_idx(const uint8_t *p) {
@@ -210,7 +193,7 @@ int main(int argc, char **argv) {
             int last_hour_idx = -1;
 
             struct L1Cache { uint64_t crc; uint16_t ep_id; uint16_t len; };
-            L1Cache l1[4096] = {};
+            L1Cache l1[8192] = {};
 
             while (p < end) {
                 uint64_t cur_hour_prefix;
@@ -233,13 +216,22 @@ int main(int argc, char **argv) {
                 else { while (p < end && *p != ' ') p++; if (p < end) p++; }
 
                 const char *ep_start = (const char *)p;
-                const char *sp = (const char *)memchr(ep_start, ' ', end - (const uint8_t *)ep_start);
-                if (!sp) break;
-                size_t ep_len = sp - ep_start;
-                p = (const uint8_t *)sp + 1;
+                uint64_t crc = 0;
+                while (true) {
+                    uint64_t v; memcpy(&v, p, 8);
+                    int sp = find_space_8(v);
+                    if (sp == -1) {
+                        crc = fast_crc_word(crc, v);
+                        p += 8;
+                    } else {
+                        for (int i = 0; i < sp; i++) crc = fast_crc_byte(crc, p[i]);
+                        p += sp + 1;
+                        break;
+                    }
+                }
+                size_t ep_len = (const char *)p - 1 - ep_start;
 
-                uint64_t crc = fast_crc(ep_start, ep_len);
-                size_t c_idx = crc & 4095;
+                size_t c_idx = crc & 8191;
                 uint16_t ep_id;
                 if (__builtin_expect(l1[c_idx].crc == crc && l1[c_idx].len == ep_len, 1)) {
                     ep_id = l1[c_idx].ep_id;
@@ -253,7 +245,7 @@ int main(int argc, char **argv) {
                 if (p[0] >= '5') {
                     global_errors[gid].fetch_add(1, std::memory_order_relaxed);
                 }
-                p += 4; // status (3 digits) + space
+                p += 4; // status + space
 
                 // Skip latency digits to newline
                 while (p < end && *p != '\n') p++;
@@ -272,8 +264,6 @@ int main(int argc, char **argv) {
         return g_endpoint_strings[a] < g_endpoint_strings[b];
     });
 
-    // Compute prefix sum offsets and thread-relative write offsets
-    // Global group start position: TOTAL_GROUPS * 4 bytes = 589 KB
     uint32_t *g_group_start = (uint32_t *)mmap(NULL, TOTAL_GROUPS * sizeof(uint32_t), PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
     uint32_t *g_group_count = (uint32_t *)mmap(NULL, TOTAL_GROUPS * sizeof(uint32_t), PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
 
@@ -296,7 +286,6 @@ int main(int argc, char **argv) {
         }
     }
 
-    // Allocate flat 12.4 MB array for ALL latencies
     size_t lats_bytes = (size_t)running_total * sizeof(uint32_t);
     uint32_t *all_lats = (uint32_t *)mmap(NULL, lats_bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
 
@@ -313,7 +302,7 @@ int main(int argc, char **argv) {
             int last_hour_idx = -1;
 
             struct L1Cache { uint64_t crc; uint16_t ep_id; uint16_t len; };
-            L1Cache l1[4096] = {};
+            L1Cache l1[8192] = {};
 
             while (p < end) {
                 uint64_t cur_hour_prefix;
@@ -336,13 +325,22 @@ int main(int argc, char **argv) {
                 else { while (p < end && *p != ' ') p++; if (p < end) p++; }
 
                 const char *ep_start = (const char *)p;
-                const char *sp = (const char *)memchr(ep_start, ' ', end - (const uint8_t *)ep_start);
-                if (!sp) break;
-                size_t ep_len = sp - ep_start;
-                p = (const uint8_t *)sp + 1;
+                uint64_t crc = 0;
+                while (true) {
+                    uint64_t v; memcpy(&v, p, 8);
+                    int sp = find_space_8(v);
+                    if (sp == -1) {
+                        crc = fast_crc_word(crc, v);
+                        p += 8;
+                    } else {
+                        for (int i = 0; i < sp; i++) crc = fast_crc_byte(crc, p[i]);
+                        p += sp + 1;
+                        break;
+                    }
+                }
+                size_t ep_len = (const char *)p - 1 - ep_start;
 
-                uint64_t crc = fast_crc(ep_start, ep_len);
-                size_t c_idx = crc & 4095;
+                size_t c_idx = crc & 8191;
                 uint16_t ep_id;
                 if (__builtin_expect(l1[c_idx].crc == crc && l1[c_idx].len == ep_len, 1)) {
                     ep_id = l1[c_idx].ep_id;
@@ -369,14 +367,12 @@ int main(int argc, char **argv) {
     for (auto &w : workers) w.join();
     workers.clear();
 
-    // Release requests.log from memory immediately!
 #if defined(__linux__)
     posix_fadvise(fd, 0, file_size, POSIX_FADV_DONTNEED);
 #endif
     munmap((void *)data, file_size);
     close(fd);
 
-    // Free thread count/write buffers immediately!
     for (unsigned int t = 0; t < num_threads; t++) {
         munmap(thread_ptrs[t], thread_buf_bytes);
     }
@@ -395,9 +391,9 @@ int main(int argc, char **argv) {
     for (int h = 0; h < 72; h++) hour_ready[h].store(false, std::memory_order_relaxed);
 
     std::atomic<int> next_hour{0};
-    unsigned int p3_threads = std::min(num_threads, 6u);
 
-    for (unsigned int t = 0; t < p3_threads; t++) {
+    // Use full hardware concurrency for Phase 3!
+    for (unsigned int t = 0; t < num_threads; t++) {
         workers.emplace_back([&, n_endpoints]() {
             char line_buf[256];
             int h;

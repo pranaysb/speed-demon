@@ -305,9 +305,9 @@ int main(int argc, char **argv) {
     size_t num_queries = queries.size();
     std::vector<int64_t> answers(num_queries, -1);
 
-    // Dynamic work-stealing queue!
+    // Dynamic work-stealing queue using full hardware concurrency
     std::atomic<size_t> next_qid{0};
-    unsigned int query_threads = std::min(num_threads, 8u);
+    unsigned int query_threads = num_threads;
 
     for (unsigned int tid = 0; tid < query_threads; tid++) {
         workers.emplace_back([&]() {

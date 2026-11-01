@@ -11,28 +11,7 @@
 #include <string>
 #include <thread>
 #include <atomic>
-
-#if defined(__x86_64__) || defined(_M_X64)
-#include <immintrin.h>
-static inline uint32_t crc32c_u64(uint32_t crc, uint64_t v) { return (uint32_t)_mm_crc32_u64(crc, v); }
-static inline uint32_t crc32c_u8(uint32_t crc, uint8_t v) { return (uint32_t)_mm_crc32_u8(crc, v); }
-#elif defined(__aarch64__) || defined(_M_ARM64)
-#include <arm_acle.h>
-static inline uint32_t crc32c_u64(uint32_t crc, uint64_t v) { return __crc32cd(crc, v); }
-static inline uint32_t crc32c_u8(uint32_t crc, uint8_t v) { return __crc32cb(crc, v); }
-#else
-static inline uint32_t crc32c_u64(uint32_t crc, uint64_t v) {
-    for (int i = 0; i < 8; i++) {
-        uint8_t b = (v >> (i * 8)) & 0xFF;
-        crc = (crc >> 8) ^ (0x82F63B78 * ((crc ^ b) & 1)); // placeholder fallback
-    }
-    return crc;
-}
-static inline uint32_t crc32c_u8(uint32_t crc, uint8_t v) {
-    return (crc >> 8) ^ (0x82F63B78 * ((crc ^ v) & 1));
-}
-#endif
-
+#include <chrono>
 
 #if defined(__linux__)
 #include <malloc.h>
@@ -40,8 +19,24 @@ static inline uint32_t crc32c_u8(uint32_t crc, uint8_t v) {
 
 #if defined(__x86_64__) || defined(_M_X64)
 #include <immintrin.h>
-#elif defined(__ARM_NEON)
+static inline uint32_t crc32c_u64(uint32_t crc, uint64_t v) { return (uint32_t)_mm_crc32_u64(crc, v); }
+static inline uint32_t crc32c_u8(uint32_t crc, uint8_t v) { return (uint32_t)_mm_crc32_u8(crc, v); }
+#elif defined(__aarch64__) || defined(_M_ARM64)
+#include <arm_acle.h>
 #include <arm_neon.h>
+static inline uint32_t crc32c_u64(uint32_t crc, uint64_t v) { return __crc32cd(crc, v); }
+static inline uint32_t crc32c_u8(uint32_t crc, uint8_t v) { return __crc32cb(crc, v); }
+#else
+static inline uint32_t crc32c_u64(uint32_t crc, uint64_t v) {
+    for (int i = 0; i < 8; i++) {
+        uint8_t b = (v >> (i * 8)) & 0xFF;
+        crc = (crc >> 8) ^ (0x82F63B78 * ((crc ^ b) & 1));
+    }
+    return crc;
+}
+static inline uint32_t crc32c_u8(uint32_t crc, uint8_t v) {
+    return (crc >> 8) ^ (0x82F63B78 * ((crc ^ v) & 1));
+}
 #endif
 
 static inline const uint8_t* find_char_simd(const uint8_t *p, const uint8_t *end, uint8_t target) {
@@ -142,12 +137,10 @@ struct FinalCountryAgg {
     uint64_t note_bytes = 0;
 };
 
-// Global lock-free 64-bit table to assign dense name_id (high 32: CRC32-C, low 32: name_id)
-static constexpr size_t NAME_MAP_CAP = 262144; // 256K slots (38% load factor for 100,520 names)
+static constexpr size_t NAME_MAP_CAP = 262144;
 static constexpr size_t NAME_MAP_MASK = NAME_MAP_CAP - 1;
-
 static std::atomic<uint64_t> g_name_map[NAME_MAP_CAP];
-static std::atomic<uint32_t> g_next_name_id{1}; // 1-based
+static std::atomic<uint32_t> g_next_name_id{1};
 
 static inline uint32_t get_or_insert_name_id(uint32_t crc) {
     if (__builtin_expect(crc == 0, 0)) crc = 0x517cc1b7;
@@ -172,7 +165,6 @@ static inline uint32_t get_or_insert_name_id(uint32_t crc) {
     }
 }
 
-// Country bitset: 131,072 bits = 2048 uint64_t words per country (covers 100,520 distinct names)
 static constexpr size_t BITSET_WORDS = 2048;
 static std::atomic<uint64_t> g_country_bitsets[256][BITSET_WORDS];
 
@@ -185,14 +177,10 @@ int main(int argc, char **argv) {
     const char *out_dir = "/out";
 
     for (int i = 1; i < argc; i++) {
-        if (strcmp(argv[i], "--data") == 0 && i + 1 < argc) {
-            data_dir = argv[++i];
-        } else if (strcmp(argv[i], "--out") == 0 && i + 1 < argc) {
-            out_dir = argv[++i];
-        }
+        if (strcmp(argv[i], "--data") == 0 && i + 1 < argc) data_dir = argv[++i];
+        else if (strcmp(argv[i], "--out") == 0 && i + 1 < argc) out_dir = argv[++i];
     }
 
-    // 1. Load regions.csv
     char regions_path[1024];
     snprintf(regions_path, sizeof(regions_path), "%s/regions.csv", data_dir);
     int rfd = open(regions_path, O_RDONLY);
@@ -203,7 +191,7 @@ int main(int argc, char **argv) {
     close(rfd);
 
     std::vector<std::string> country_names;
-    country_names.push_back("_UNMATCHED"); // index 0
+    country_names.push_back("_UNMATCHED");
 
     std::vector<uint16_t> region_to_cid(1000005, 0);
     uint16_t code3_to_cid[26 * 26 * 26];
@@ -252,21 +240,15 @@ int main(int argc, char **argv) {
 
     size_t num_countries = country_names.size();
 
-    // 2. Map records.csv
     char records_path[1024];
     snprintf(records_path, sizeof(records_path), "%s/records.csv", data_dir);
-
     int fd = open(records_path, O_RDONLY);
     if (fd < 0) { perror("open records"); return 1; }
-
-    struct stat st;
-    fstat(fd, &st);
+    struct stat st; fstat(fd, &st);
     size_t file_size = st.st_size;
 
     const uint8_t *data = (const uint8_t *)mmap(NULL, file_size, PROT_READ, MAP_SHARED, fd, 0);
-    unsigned int num_threads = std::thread::hardware_concurrency();
-    if (num_threads == 0) num_threads = 4;
-    if (num_threads > 12) num_threads = 12;
+    unsigned int num_threads = std::clamp(std::thread::hardware_concurrency(), 1u, 12u);
 
     std::vector<const uint8_t *> chunk_starts(num_threads);
     std::vector<const uint8_t *> chunk_ends(num_threads);
@@ -285,9 +267,7 @@ int main(int argc, char **argv) {
                 if (*p == '\n') {
                     p++;
                     const uint8_t *rec = p;
-                    if (end - rec >= 3 && rec[0] == 0xEF && rec[1] == 0xBB && rec[2] == 0xBF) {
-                        rec += 3;
-                    }
+                    if (end - rec >= 3 && rec[0] == 0xEF && rec[1] == 0xBB && rec[2] == 0xBF) rec += 3;
                     if (rec < end && *rec >= '1' && *rec <= '9') {
                         const uint8_t *d = rec;
                         while (d < end && *d >= '0' && *d <= '9') d++;
@@ -314,8 +294,11 @@ int main(int argc, char **argv) {
             const uint8_t *end = chunk_ends[t];
             auto &aggs = thread_aggs[t];
             size_t reg_limit = region_to_cid.size();
-            struct L1NameEntry { uint32_t crc; uint32_t nid; uint16_t last_cid; };
-            L1NameEntry l1_names[4096] = {};
+
+            // 8,192-entry direct-mapped L1 cache (32 KB, fits in 48KB L1D cache)
+            static constexpr size_t L1_CAP = 8192;
+            static constexpr size_t L1_MASK = L1_CAP - 1;
+            uint32_t l1_cache[L1_CAP] = {};
 
             while (p < end) {
                 if (end - p >= 3 && p[0] == 0xEF && p[1] == 0xBB && p[2] == 0xBF) p += 3;
@@ -341,16 +324,13 @@ int main(int argc, char **argv) {
                         size_t rem = span;
                         const uint8_t *sp_p = p;
                         while (rem >= 8) {
-                            uint64_t v;
-                            memcpy(&v, sp_p, 8);
+                            uint64_t v; memcpy(&v, sp_p, 8);
                             n_crc = crc32c_u64(n_crc, v);
-                            sp_p += 8;
-                            rem -= 8;
+                            sp_p += 8; rem -= 8;
                         }
                         while (rem > 0) {
                             n_crc = crc32c_u8(n_crc, *sp_p);
-                            sp_p++;
-                            rem--;
+                            sp_p++; rem--;
                         }
                         p = next_q;
                         if (p < end) {
@@ -359,7 +339,7 @@ int main(int argc, char **argv) {
                                 name_len++;
                                 p += 2;
                             } else {
-                                p++; // closing quote
+                                p++;
                                 break;
                             }
                         }
@@ -371,23 +351,20 @@ int main(int argc, char **argv) {
                     size_t rem = name_len;
                     const uint8_t *sp_p = p;
                     while (rem >= 8) {
-                        uint64_t v;
-                        memcpy(&v, sp_p, 8);
+                        uint64_t v; memcpy(&v, sp_p, 8);
                         n_crc = crc32c_u64(n_crc, v);
-                        sp_p += 8;
-                        rem -= 8;
+                        sp_p += 8; rem -= 8;
                     }
                     while (rem > 0) {
                         n_crc = crc32c_u8(n_crc, *sp_p);
-                        sp_p++;
-                        rem--;
+                        sp_p++; rem--;
                     }
                     p = nc;
                     if (p < end && *p == ',') p++;
                 }
                 n_crc ^= 0xFFFFFFFF;
                 
-                // 3. note (SIMD accelerated)
+                // 3. note
                 uint64_t note_len = 0;
                 if (p < end && *p == '"') {
                     p++;
@@ -400,7 +377,7 @@ int main(int argc, char **argv) {
                                 note_len++;
                                 p += 2;
                             } else {
-                                p++; // closing quote
+                                p++;
                                 break;
                             }
                         }
@@ -421,7 +398,7 @@ int main(int argc, char **argv) {
                 }
                 if (p < end && *p == ',') p++;
 
-                // 5. amount (branchless fraction)
+                // 5. amount
                 int64_t sign = 1;
                 if (p < end && *p == '-') {
                     sign = -1;
@@ -455,30 +432,23 @@ int main(int argc, char **argv) {
                 ca.name_bytes += name_len;
                 ca.note_bytes += note_len;
 
-                // Lookup dense name ID and set in country bitset
-                uint32_t l1_idx = n_crc & 4095;
-                if (__builtin_expect(l1_names[l1_idx].crc == n_crc && l1_names[l1_idx].last_cid == cid, 1)) {
-                    // Already set in this country bitset
-                } else {
-                    uint32_t nid;
-                    if (l1_names[l1_idx].crc == n_crc && l1_names[l1_idx].nid != 0) {
-                        nid = l1_names[l1_idx].nid;
-                    } else {
-                        nid = get_or_insert_name_id(n_crc);
-                    }
-                    l1_names[l1_idx] = {n_crc, nid, cid};
+                // Lock-free L1 Country-Name Cache
+                uint32_t tag = n_crc | 1;
+                uint32_t l1_idx = (n_crc ^ ((uint32_t)cid * 0x9e3779b9)) & L1_MASK;
+                if (__builtin_expect(l1_cache[l1_idx] != tag, 0)) {
+                    uint32_t nid = get_or_insert_name_id(n_crc);
                     uint32_t word_idx = nid / 64;
                     uint64_t bit_mask = 1ULL << (nid % 64);
                     uint64_t old_val = g_country_bitsets[cid][word_idx].load(std::memory_order_relaxed);
                     if ((old_val & bit_mask) == 0) {
                         g_country_bitsets[cid][word_idx].fetch_or(bit_mask, std::memory_order_relaxed);
                     }
+                    l1_cache[l1_idx] = tag;
                 }
             }
         });
     }
     for (auto &w : workers) w.join();
-    workers.clear();
 
 #if defined(__linux__)
     posix_fadvise(fd, 0, file_size, POSIX_FADV_DONTNEED);
@@ -486,67 +456,67 @@ int main(int argc, char **argv) {
     munmap((void *)data, file_size);
     close(fd);
 
-    // Merge country aggregates across threads
+    // Merge country aggregates
     std::vector<FinalCountryAgg> final_aggs(num_countries);
     for (size_t c = 0; c < num_countries; c++) {
         final_aggs[c].key = country_names[c];
-        FinalCountryAgg &fa = final_aggs[c];
-
-        for (unsigned int thr = 0; thr < num_threads; thr++) {
-            auto &ca = thread_aggs[thr][c];
-            if (ca.count == 0) continue;
-            fa.count += ca.count;
-            fa.id_sum += ca.id_sum;
-            fa.amount_sum += ca.amount_sum;
-            if (fa.count == ca.count) {
-                fa.amount_min = ca.amount_min;
-                fa.amount_max = ca.amount_max;
-            } else {
-                if (ca.amount_min < fa.amount_min) fa.amount_min = ca.amount_min;
-                if (ca.amount_max > fa.amount_max) fa.amount_max = ca.amount_max;
+        bool has_amt = false;
+        for (unsigned int t = 0; t < num_threads; t++) {
+            const auto &ca = thread_aggs[t][c];
+            final_aggs[c].count += ca.count;
+            final_aggs[c].id_sum += ca.id_sum;
+            final_aggs[c].amount_sum += ca.amount_sum;
+            if (ca.has_amount) {
+                if (!has_amt) {
+                    final_aggs[c].amount_min = ca.amount_min;
+                    final_aggs[c].amount_max = ca.amount_max;
+                    has_amt = true;
+                } else {
+                    if (ca.amount_min < final_aggs[c].amount_min) final_aggs[c].amount_min = ca.amount_min;
+                    if (ca.amount_max > final_aggs[c].amount_max) final_aggs[c].amount_max = ca.amount_max;
+                }
             }
-            fa.name_bytes += ca.name_bytes;
-            fa.note_bytes += ca.note_bytes;
+            final_aggs[c].name_bytes += ca.name_bytes;
+            final_aggs[c].note_bytes += ca.note_bytes;
         }
 
-        if (fa.count > 0) {
-            uint64_t distinct = 0;
-            for (size_t w = 0; w < BITSET_WORDS; w++) {
-                uint64_t val = g_country_bitsets[c][w].load(std::memory_order_relaxed);
-                if (val) distinct += __builtin_popcountll(val);
-            }
-            fa.names_distinct = distinct;
+        // Count set bits in country bitset
+        uint64_t distinct_count = 0;
+        for (size_t w = 0; w < BITSET_WORDS; w++) {
+            distinct_count += __builtin_popcountll(g_country_bitsets[c][w].load(std::memory_order_relaxed));
         }
+        final_aggs[c].names_distinct = distinct_count;
     }
 
-    // Sort final output by country code
     std::sort(final_aggs.begin(), final_aggs.end(), [](const FinalCountryAgg &a, const FinalCountryAgg &b) {
         return a.key < b.key;
     });
 
-    mkdir(out_dir, 0777);
     char out_path[1024];
     snprintf(out_path, sizeof(out_path), "%s/aggregates.txt", out_dir);
-
     FILE *fout = fopen(out_path, "wb");
+    if (!fout) { perror("fopen aggregates.txt"); return 1; }
     char *out_buf = (char *)malloc(1024 * 1024);
     setvbuf(fout, out_buf, _IOFBF, 1024 * 1024);
 
     char line_buf[512];
-    for (const auto &fa : final_aggs) {
-        if (fa.count == 0) continue;
-        char *cur = line_buf;
-        memcpy(cur, fa.key.data(), fa.key.size()); cur += fa.key.size();
-        *cur++ = ' ';
-        cur = fast_u64(cur, fa.count); *cur++ = ' ';
-        cur = fast_u64(cur, fa.id_sum); *cur++ = ' ';
-        cur = format_cents(cur, fa.amount_sum); *cur++ = ' ';
-        cur = format_cents(cur, fa.amount_min); *cur++ = ' ';
-        cur = format_cents(cur, fa.amount_max); *cur++ = ' ';
-        cur = fast_u64(cur, fa.names_distinct); *cur++ = ' ';
-        cur = fast_u64(cur, fa.name_bytes); *cur++ = ' ';
-        cur = fast_u64(cur, fa.note_bytes); *cur++ = '\n';
-        fwrite(line_buf, 1, cur - line_buf, fout);
+    for (const auto &agg : final_aggs) {
+        if (agg.count == 0) continue;
+        char *p = line_buf;
+        memcpy(p, agg.key.data(), agg.key.size());
+        p += agg.key.size();
+        *p++ = ' ';
+
+        p = fast_u64(p, agg.count); *p++ = ' ';
+        p = fast_u64(p, agg.id_sum); *p++ = ' ';
+        p = format_cents(p, agg.amount_sum); *p++ = ' ';
+        p = format_cents(p, agg.amount_min); *p++ = ' ';
+        p = format_cents(p, agg.amount_max); *p++ = ' ';
+        p = fast_u64(p, agg.names_distinct); *p++ = ' ';
+        p = fast_u64(p, agg.name_bytes); *p++ = ' ';
+        p = fast_u64(p, agg.note_bytes); *p++ = '\n';
+
+        fwrite(line_buf, 1, p - line_buf, fout);
     }
     fclose(fout);
     free(out_buf);
