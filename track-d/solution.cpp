@@ -305,8 +305,6 @@ int main(int argc, char **argv) {
 #endif
 
     auto t_graph_done = std::chrono::high_resolution_clock::now();
-    double d_graph = std::chrono::duration<double, std::milli>(t_graph_done - t_start).count();
-    printf("Two-Stage Graph Ingestion: %.2f ms\n", d_graph);
 
     // Read queries
     char queries_path[1024];
@@ -339,7 +337,7 @@ int main(int argc, char **argv) {
     std::vector<int64_t> answers(num_queries, -1);
 
     std::atomic<size_t> next_qid{0};
-    unsigned int query_threads = num_threads;
+    unsigned int query_threads = std::min(num_threads, 8u);
 
     for (unsigned int tid = 0; tid < query_threads; tid++) {
         workers.emplace_back([&]() {
@@ -438,10 +436,6 @@ int main(int argc, char **argv) {
     }
     fclose(fout);
     free(out_buf);
-
-    auto t_all_done = std::chrono::high_resolution_clock::now();
-    double d_all = std::chrono::duration<double, std::milli>(t_all_done - t_start).count();
-    printf("Total Track D Time: %.2f ms\n", d_all);
 
     return 0;
 }

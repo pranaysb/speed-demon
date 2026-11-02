@@ -160,7 +160,7 @@ static std::atomic<uint32_t> g_next_name_id{1};
 
 static inline uint32_t get_or_insert_name_id(uint32_t crc) {
     if (__builtin_expect(crc == 0, 0)) crc = 0x517cc1b7;
-    size_t idx = (size_t)crc & NAME_MAP_MASK;
+    size_t idx = ((uint64_t)crc * 0x517cc1b727220a95ULL) & NAME_MAP_MASK;
     while (true) {
         uint64_t entry = g_name_map[idx].load(std::memory_order_relaxed);
         if ((uint32_t)(entry >> 32) == crc) {
@@ -312,10 +312,10 @@ int main(int argc, char **argv) {
             auto &aggs = thread_aggs[t];
             size_t reg_limit = region_to_cid.size();
 
-            static constexpr size_t L1_CAP = 65536;
+            // 16,384-entry direct-mapped L1 cache (64 KB L1/L2 resident)
+            static constexpr size_t L1_CAP = 16384;
             static constexpr size_t L1_MASK = L1_CAP - 1;
-            auto l1_cache_buf = std::make_unique<uint64_t[]>(L1_CAP);
-            uint64_t *l1_cache = l1_cache_buf.get();
+            uint32_t l1_cache[L1_CAP] = {};
 
             while (p < end) {
                 if (__builtin_expect(end - p >= 3 && p[0] == 0xEF && p[1] == 0xBB && p[2] == 0xBF, 0)) p += 3;
@@ -451,8 +451,8 @@ int main(int argc, char **argv) {
                 ca.name_bytes += name_len;
                 ca.note_bytes += note_len;
 
-                // 64-bit Tag Lock-free L1 Country-Name Cache
-                uint64_t tag = ((uint64_t)cid << 32) | (n_crc | 1);
+                // Lock-free L1 Country-Name Cache
+                uint32_t tag = n_crc | 1;
                 uint32_t l1_idx = (n_crc ^ ((uint32_t)cid * 0x9e3779b9)) & L1_MASK;
                 if (__builtin_expect(l1_cache[l1_idx] != tag, 0)) {
                     uint32_t nid = get_or_insert_name_id(n_crc);

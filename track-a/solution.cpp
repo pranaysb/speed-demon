@@ -370,7 +370,7 @@ int main(int argc, char **argv) {
                         for (size_t i = 0; i < n; i++) {
                             uint16_t code = blk->items[i].ep_code;
                             uint16_t ep = code & 0x7FFF;
-                            if (code & 0x8000) ep_errors[ep]++;
+                            ep_errors[ep] += (code >> 15);
                             uint32_t pos = ep_cur[ep]++;
                             sorted_latencies[pos] = blk->items[i].lat;
                         }
