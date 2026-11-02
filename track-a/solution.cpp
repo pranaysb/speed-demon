@@ -13,7 +13,6 @@
 #include <thread>
 #include <mutex>
 #include <atomic>
-#include <chrono>
 
 #if defined(__linux__)
 #include <malloc.h>
@@ -63,7 +62,8 @@ static inline uint64_t fast_hash(const char *p, size_t len) {
     uint64_t h = 0xcbf29ce484222325ULL ^ len;
     size_t i = 0;
     while (i + 8 <= len) {
-        uint64_t v; memcpy(&v, p + i, 8);
+        uint64_t v;
+        memcpy(&v, p + i, 8);
         h = (h ^ v) * 0x100000001b3ULL;
         i += 8;
     }
@@ -102,6 +102,13 @@ static uint16_t get_or_insert_endpoint_with_hash(const char *p, size_t len, uint
     return id;
 }
 
+#pragma pack(push, 2)
+struct Item6 {
+    uint32_t lat;
+    uint16_t ep_code; // bit 15: is_err, bits 0..14: ep_id
+};
+#pragma pack(pop)
+
 struct L1CacheEntry {
     uint64_t hash;
     uint16_t ep_id;
@@ -124,12 +131,17 @@ static inline char* fast_u64(char *p, uint64_t v) {
     return p;
 }
 
+static constexpr size_t BLOCK_CAP = 1024;
+struct ItemBlock {
+    Item6 items[BLOCK_CAP];
+    ItemBlock *next;
+};
+
 int main(int argc, char **argv) {
 #if defined(__linux__)
     mallopt(M_ARENA_MAX, 1);
 #endif
-    auto t_start = std::chrono::high_resolution_clock::now();
-    init_hour_strings();
+        init_hour_strings();
 
     const char *data_dir = "/data";
     const char *out_dir = "/out";
@@ -150,7 +162,9 @@ int main(int argc, char **argv) {
     size_t file_size = st.st_size;
 
     const uint8_t *data = (const uint8_t *)mmap(NULL, file_size, PROT_READ, MAP_SHARED, fd, 0);
-    unsigned int num_threads = std::clamp(std::thread::hardware_concurrency(), 1u, 12u);
+    unsigned int num_threads = std::thread::hardware_concurrency();
+    if (num_threads == 0) num_threads = 4;
+    if (num_threads > 12) num_threads = 12;
 
     std::vector<const uint8_t *> chunk_starts(num_threads);
     std::vector<const uint8_t *> chunk_ends(num_threads);
@@ -169,30 +183,53 @@ int main(int argc, char **argv) {
     }
     chunk_ends[num_threads - 1] = data + file_size;
 
-    // Phase 1: Parallel count per (hour, ep)
-    // Structure: 72 hours * 2048 endpoints = 147,456 slots (589 KB per thread)
-    struct ThreadCountTable {
-        uint32_t counts[72][MAX_ENDPOINTS];
-        uint32_t errors[72][MAX_ENDPOINTS];
-    };
-    std::vector<ThreadCountTable *> thread_tables(num_threads);
+    // Sized arena for 1024-item blocks (~16MB total across all threads)
+    size_t blocks_per_thread = (file_size / (num_threads * 70 * BLOCK_CAP)) + 25;
+    size_t arena_bytes = blocks_per_thread * sizeof(ItemBlock);
+
+    std::vector<ItemBlock *> thread_arenas(num_threads);
     for (unsigned int t = 0; t < num_threads; t++) {
-        thread_tables[t] = (ThreadCountTable *)calloc(1, sizeof(ThreadCountTable));
+        thread_arenas[t] = (ItemBlock *)mmap(NULL, arena_bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+    }
+
+    struct ThreadHourHead {
+        ItemBlock *head = nullptr;
+        ItemBlock *tail = nullptr;
+        uint16_t tail_count = 0;
+        uint32_t total_count = 0;
+    };
+
+    std::vector<std::vector<ThreadHourHead>> thread_hours(num_threads, std::vector<ThreadHourHead>(72));
+
+    // Pre-allocated histogram tables per thread: 72 * 2048 * 2 bytes = 288 KB
+    struct ThreadHist {
+        uint16_t counts[72][MAX_ENDPOINTS];
+    };
+    std::vector<ThreadHist *> thread_hists(num_threads);
+    for (unsigned int t = 0; t < num_threads; t++) {
+        thread_hists[t] = (ThreadHist *)mmap(NULL, sizeof(ThreadHist), PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
     }
 
     std::vector<std::thread> workers;
 
     for (unsigned int t = 0; t < num_threads; t++) {
-        workers.emplace_back([t, &thread_tables, &chunk_starts, &chunk_ends]() {
+        workers.emplace_back([t, &thread_arenas, &thread_hours, &thread_hists, &chunk_starts, &chunk_ends]() {
             const uint8_t *p = chunk_starts[t];
             const uint8_t *end = chunk_ends[t];
-            auto &tbl = *thread_tables[t];
+            ItemBlock *arena = thread_arenas[t];
+            size_t arena_idx = 0;
+            auto &hours = thread_hours[t];
+            auto &hist = *thread_hists[t];
 
             uint64_t last_hour_prefix = 0;
             int last_hour_idx = -1;
             L1CacheEntry l1_cache[4096] = {};
 
+            
+
             while (p < end) {
+
+
                 uint64_t cur_hour_prefix;
                 memcpy(&cur_hour_prefix, p + 5, 8);
                 int hour_idx;
@@ -219,168 +256,138 @@ int main(int argc, char **argv) {
                 p = (const uint8_t *)sp + 1;
 
                 uint64_t h = fast_hash(ep_start, ep_len);
-                size_t l1_idx = h & 4095;
+                size_t c_idx = h & 4095;
                 uint16_t ep_id;
-                if (__builtin_expect(l1_cache[l1_idx].hash == h && l1_cache[l1_idx].len == ep_len, 1)) {
-                    ep_id = l1_cache[l1_idx].ep_id;
+                if (__builtin_expect(l1_cache[c_idx].hash == h && l1_cache[c_idx].len == ep_len, 1)) {
+                    ep_id = l1_cache[c_idx].ep_id;
                 } else {
                     ep_id = get_or_insert_endpoint_with_hash(ep_start, ep_len, h);
-                    l1_cache[l1_idx] = {h, ep_id, (uint16_t)ep_len};
+                    l1_cache[c_idx] = {h, ep_id, (uint16_t)ep_len};
                 }
 
-                bool is_err = (p[0] == '5');
-                tbl.counts[hour_idx][ep_id]++;
-                if (is_err) tbl.errors[hour_idx][ep_id]++;
-
-                p += 4; // skip status and space
-                while (p < end && *p != '\n') p++;
-                if (p < end && *p == '\n') p++;
-            }
-        });
-    }
-    for (auto &w : workers) w.join();
-    workers.clear();
-
-    // Sum counts and build global CSR write offsets per (hour, ep, thread)
-    // Total requests across all hours
-    size_t total_requests = 0;
-    static uint32_t global_counts[72][MAX_ENDPOINTS] = {};
-    static uint32_t global_errors[72][MAX_ENDPOINTS] = {};
-    static uint32_t thread_start_pos[12][72][MAX_ENDPOINTS] = {};
-
-    size_t running_total = 0;
-    for (int h = 0; h < 72; h++) {
-        for (size_t ep = 0; ep < g_num_endpoints; ep++) {
-            uint32_t total_ep = 0;
-            uint32_t total_err = 0;
-            for (unsigned int t = 0; t < num_threads; t++) {
-                thread_start_pos[t][h][ep] = running_total + total_ep;
-                total_ep += thread_tables[t]->counts[h][ep];
-                total_err += thread_tables[t]->errors[h][ep];
-            }
-            global_counts[h][ep] = total_ep;
-            global_errors[h][ep] = total_err;
-            running_total += total_ep;
-        }
-    }
-    total_requests = running_total;
-
-    // Flat latencies array: 3,100,000 * 4 bytes = 12.4 MB!
-    size_t lat_bytes = total_requests * sizeof(uint32_t);
-    uint32_t *all_latencies = (uint32_t *)mmap(NULL, lat_bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
-
-    // Phase 2: Direct write into all_latencies reusing thread_tables as cur_pos (0 extra memory!)
-    for (unsigned int t = 0; t < num_threads; t++) {
-        workers.emplace_back([t, &thread_tables, &chunk_starts, &chunk_ends, all_latencies]() {
-            const uint8_t *p = chunk_starts[t];
-            const uint8_t *end = chunk_ends[t];
-
-            uint64_t last_hour_prefix = 0;
-            int last_hour_idx = -1;
-            L1CacheEntry l1_cache[4096] = {};
-
-            // Reuse thread_tables[t]->counts directly as cur_pos!
-            uint32_t (*cur_pos)[MAX_ENDPOINTS] = thread_tables[t]->counts;
-            for (int h = 0; h < 72; h++) {
-                for (size_t ep = 0; ep < g_num_endpoints; ep++) {
-                    cur_pos[h][ep] = thread_start_pos[t][h][ep];
-                }
-            }
-
-            while (p < end) {
-                uint64_t cur_hour_prefix;
-                memcpy(&cur_hour_prefix, p + 5, 8);
-                int hour_idx;
-                if (__builtin_expect(cur_hour_prefix == last_hour_prefix, 1)) {
-                    hour_idx = last_hour_idx;
-                } else {
-                    last_hour_prefix = cur_hour_prefix;
-                    hour_idx = parse_hour_idx(p);
-                    last_hour_idx = hour_idx;
-                }
-
-                p += 28;
-                if (p[3] == ' ') p += 4;
-                else if (p[4] == ' ') p += 5;
-                else if (p[5] == ' ') p += 6;
-                else if (p[6] == ' ') p += 7;
-                else if (p[7] == ' ') p += 8;
-                else { while (p < end && *p != ' ') p++; if (p < end) p++; }
-
-                const char *ep_start = (const char *)p;
-                const char *sp = (const char *)memchr(ep_start, ' ', end - (const uint8_t *)ep_start);
-                if (!sp) break;
-                size_t ep_len = sp - ep_start;
-                p = (const uint8_t *)sp + 1;
-
-                uint64_t h = fast_hash(ep_start, ep_len);
-                size_t l1_idx = h & 4095;
-                uint16_t ep_id;
-                if (__builtin_expect(l1_cache[l1_idx].hash == h && l1_cache[l1_idx].len == ep_len, 1)) {
-                    ep_id = l1_cache[l1_idx].ep_id;
-                } else {
-                    ep_id = get_or_insert_endpoint_with_hash(ep_start, ep_len, h);
-                    l1_cache[l1_idx] = {h, ep_id, (uint16_t)ep_len};
-                }
-
-                p += 4; // skip status and space
+                uint16_t is_err = (p[0] >= '5') ? 0x8000 : 0;
+                p += 4; // status + space
 
                 uint32_t lat = 0;
                 while (p < end && *p >= '0' && *p <= '9') {
-                    lat = lat * 10 + (*p++ - '0');
+                    lat = lat * 10 + (*p - '0');
+                    p++;
                 }
-                if (p < end && *p == '\r') p++;
-                if (p < end && *p == '\n') p++;
+                if (*p == '\r') p++;
+                if (*p == '\n') p++;
 
-                all_latencies[cur_pos[hour_idx][ep_id]++] = lat;
+                hist.counts[hour_idx][ep_id]++;
+
+                ThreadHourHead &hh = hours[hour_idx];
+                if (hh.tail_count == BLOCK_CAP || hh.tail == nullptr) {
+                    ItemBlock *new_block = &arena[arena_idx++];
+                    new_block->next = nullptr;
+                    if (!hh.head) hh.head = new_block;
+                    else hh.tail->next = new_block;
+                    hh.tail = new_block;
+                    hh.tail_count = 0;
+                }
+                hh.tail->items[hh.tail_count++] = {lat, (uint16_t)(ep_id | is_err)};
+                hh.total_count++;
             }
+
         });
     }
     for (auto &w : workers) w.join();
     workers.clear();
 
-    for (unsigned int t = 0; t < num_threads; t++) free(thread_tables[t]);
-
-#if defined(__linux__)
-    posix_fadvise(fd, 0, file_size, POSIX_FADV_DONTNEED);
-#endif
-    munmap((void *)data, file_size);
+        munmap((void *)data, file_size);
     close(fd);
 
-    // Sorted endpoints order
+    // Sort endpoints
     std::vector<uint16_t> sorted_endpoint_ids(g_num_endpoints);
     for (size_t i = 0; i < g_num_endpoints; i++) sorted_endpoint_ids[i] = (uint16_t)i;
     std::sort(sorted_endpoint_ids.begin(), sorted_endpoint_ids.end(), [](uint16_t a, uint16_t b) {
         return g_endpoint_strings[a] < g_endpoint_strings[b];
     });
 
+    // Prepare streaming output file
     mkdir(out_dir, 0777);
     char out_path[1024];
     snprintf(out_path, sizeof(out_path), "%s/summary.txt", out_dir);
     FILE *fout = fopen(out_path, "wb");
-    char *out_buf = (char *)malloc(1024 * 1024);
-    setvbuf(fout, out_buf, _IOFBF, 1024 * 1024);
+    char *out_buf = (char *)malloc(512 * 1024);
+    setvbuf(fout, out_buf, _IOFBF, 512 * 1024);
 
     std::vector<std::string> hour_outputs(72);
     std::vector<std::atomic<bool>> hour_ready(72);
-    for (int h = 0; h < 72; h++) hour_ready[h].store(false);
+    for (int h = 0; h < 72; h++) hour_ready[h].store(false, std::memory_order_relaxed);
 
     std::atomic<int> next_hour{0};
-    for (unsigned int t = 0; t < num_threads; t++) {
-        workers.emplace_back([&]() {
+    unsigned int p2_threads = num_threads;
+
+    for (unsigned int t = 0; t < p2_threads; t++) {
+        workers.emplace_back([&next_hour, &hour_outputs, &hour_ready, &sorted_endpoint_ids,
+                              &thread_hours, &thread_hists, num_threads]() {
+            char line_buf[256];
+            uint32_t ep_counts[MAX_ENDPOINTS];
+            uint32_t ep_errors[MAX_ENDPOINTS];
+            uint32_t ep_offsets[MAX_ENDPOINTS + 1];
+            uint32_t ep_cur[MAX_ENDPOINTS];
+            std::vector<uint32_t> sorted_latencies;
+            sorted_latencies.reserve(45000);
+
             int h;
-            char line_buf[512];
-            while ((h = next_hour.fetch_add(1, std::memory_order_relaxed)) < 72) {
+            while ((h = next_hour.fetch_add(1)) < 72) {
+                // Sum counts and errors directly from histograms in 0.05ms!
+                memset(ep_counts, 0, sizeof(ep_counts));
+                memset(ep_errors, 0, sizeof(ep_errors));
+
+                uint32_t h_count = 0;
+                for (unsigned int thr = 0; thr < num_threads; thr++) {
+                    const auto &th = *thread_hists[thr];
+                    for (size_t ep = 0; ep < g_num_endpoints; ep++) {
+                        ep_counts[ep] += th.counts[h][ep];
+                    }
+                    h_count += thread_hours[thr][h].total_count;
+                }
+                if (h_count == 0) {
+                    hour_ready[h].store(true, std::memory_order_release);
+                    continue;
+                }
+
+                uint32_t tot_h = 0;
+                size_t active_eps = 0;
+                for (size_t ep = 0; ep < g_num_endpoints; ep++) {
+                    ep_offsets[ep] = tot_h;
+                    ep_cur[ep] = tot_h;
+                    tot_h += ep_counts[ep];
+                    if (ep_counts[ep] > 0) active_eps++;
+                }
+
+                sorted_latencies.resize(tot_h);
+                // SINGLE PASS scatter into sorted_latencies + on-the-fly error counting
+                for (unsigned int thr = 0; thr < num_threads; thr++) {
+                    auto &hh = thread_hours[thr][h];
+                    ItemBlock *blk = hh.head;
+                    while (blk) {
+                        size_t n = (blk == hh.tail) ? hh.tail_count : BLOCK_CAP;
+                        for (size_t i = 0; i < n; i++) {
+                            uint16_t code = blk->items[i].ep_code;
+                            uint16_t ep = code & 0x7FFF;
+                            if (code & 0x8000) ep_errors[ep]++;
+                            uint32_t pos = ep_cur[ep]++;
+                            sorted_latencies[pos] = blk->items[i].lat;
+                        }
+                        blk = blk->next;
+                    }
+                }
+
                 std::string &out = hour_outputs[h];
+                out.reserve(active_eps * 60);
                 const char *h_str = g_hour_strings[h];
 
                 for (uint16_t ep_id : sorted_endpoint_ids) {
-                    uint32_t n = global_counts[h][ep_id];
+                    uint32_t n = ep_counts[ep_id];
                     if (n == 0) continue;
 
-                    uint32_t start_pos = thread_start_pos[0][h][ep_id];
-                    uint32_t *lats = all_latencies + start_pos;
-
+                    uint32_t start_pos = ep_offsets[ep_id];
+                    uint32_t *lats = &sorted_latencies[start_pos];
                     if (n == 2) {
                         if (lats[0] > lats[1]) std::swap(lats[0], lats[1]);
                     } else if (n > 2) {
@@ -399,7 +406,7 @@ int main(int argc, char **argv) {
                     uint32_t p95 = lats[rank95 - 1];
                     uint32_t p99 = lats[rank99 - 1];
 
-                    uint32_t errs = global_errors[h][ep_id];
+                    uint32_t errs = ep_errors[ep_id];
                     uint64_t ppm = (uint64_t)errs * 1000000ULL / n;
 
                     char *cur = line_buf;
@@ -424,6 +431,7 @@ int main(int argc, char **argv) {
         });
     }
 
+    // Stream writes in sequential hour order and immediately free string buffers!
     for (int h = 0; h < 72; h++) {
         while (!hour_ready[h].load(std::memory_order_acquire)) {
             std::this_thread::yield();
@@ -438,11 +446,13 @@ int main(int argc, char **argv) {
     free(out_buf);
 
     for (auto &w : workers) w.join();
-    munmap(all_latencies, lat_bytes);
 
-    auto t_done = std::chrono::high_resolution_clock::now();
-    double ms = std::chrono::duration<double, std::milli>(t_done - t_start).count();
-    printf("Direct Flat CSR Track A completed in: %.2f ms (Total items: %zu)\n", ms, total_requests);
+    
+    for (unsigned int t = 0; t < num_threads; t++) {
+        munmap(thread_arenas[t], arena_bytes);
+        munmap(thread_hists[t], sizeof(ThreadHist));
+    }
+
 
     return 0;
 }
