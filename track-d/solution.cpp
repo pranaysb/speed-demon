@@ -202,42 +202,58 @@ int main(int argc, char **argv) {
     }
     chunk_ends[num_threads - 1] = edges_end;
 
-    // 1. Parallel line counting
-    std::vector<size_t> thread_counts(num_threads, 0);
-    std::vector<std::thread> workers;
+    std::vector<std::atomic<uint32_t>> f_offsets_atomic(num_nodes + 1);
+    std::vector<std::atomic<uint32_t>> b_offsets_atomic(num_nodes + 1);
+    for (uint32_t i = 0; i <= num_nodes; i++) {
+        f_offsets_atomic[i].store(0, std::memory_order_relaxed);
+        b_offsets_atomic[i].store(0, std::memory_order_relaxed);
+    }
 
+    std::vector<std::thread> workers;
     for (unsigned int t = 0; t < num_threads; t++) {
-        workers.emplace_back([t, &chunk_starts, &chunk_ends, &thread_counts]() {
+        workers.emplace_back([t, &chunk_starts, &chunk_ends, &f_offsets_atomic, &b_offsets_atomic]() {
             const uint8_t *cur = chunk_starts[t];
             const uint8_t *cend = chunk_ends[t];
-            size_t c = 0;
             while (cur < cend) {
-                if (*cur == '\n') c++;
-                cur++;
+                uint32_t u, v;
+                cur = fast_parse_u32(cur, &u); cur++;
+                cur = fast_parse_u32(cur, &v);
+                f_offsets_atomic[u + 1].fetch_add(1, std::memory_order_relaxed);
+                b_offsets_atomic[v + 1].fetch_add(1, std::memory_order_relaxed);
+                while (cur < cend && *cur != '\n') cur++;
+                if (cur < cend) cur++;
             }
-            thread_counts[t] = c;
         });
     }
     for (auto &w : workers) w.join();
     workers.clear();
 
-    std::vector<size_t> start_positions(num_threads, 0);
-    size_t running_pos = 0;
-    for (unsigned int t = 0; t < num_threads; t++) {
-        start_positions[t] = running_pos;
-        running_pos += thread_counts[t];
+    std::vector<uint32_t> f_offsets(num_nodes + 1, 0);
+    std::vector<uint32_t> b_offsets(num_nodes + 1, 0);
+    uint32_t f_tot = 0, b_tot = 0;
+    for (uint32_t i = 0; i <= num_nodes; i++) {
+        f_tot += f_offsets_atomic[i].load(std::memory_order_relaxed);
+        b_tot += b_offsets_atomic[i].load(std::memory_order_relaxed);
+        f_offsets[i] = f_tot;
+        b_offsets[i] = b_tot;
+    }
+    std::vector<std::atomic<uint32_t>>().swap(f_offsets_atomic);
+    std::vector<std::atomic<uint32_t>>().swap(b_offsets_atomic);
+
+    std::vector<std::atomic<uint32_t>> f_cur(num_nodes);
+    std::vector<std::atomic<uint32_t>> b_cur(num_nodes);
+    for (uint32_t i = 0; i < num_nodes; i++) {
+        f_cur[i].store(f_offsets[i], std::memory_order_relaxed);
+        b_cur[i].store(b_offsets[i], std::memory_order_relaxed);
     }
 
-    // 2. Parse directly into raw_edges
-    size_t raw_edge_bytes = (size_t)num_edges * sizeof(Edge32);
-    Edge32 *raw_edges = (Edge32 *)mmap(NULL, raw_edge_bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+    std::vector<Edge> f_edges(num_edges);
+    std::vector<Edge> b_edges(num_edges);
 
     for (unsigned int t = 0; t < num_threads; t++) {
-        workers.emplace_back([t, &chunk_starts, &chunk_ends, &start_positions, raw_edges]() {
+        workers.emplace_back([t, &chunk_starts, &chunk_ends, &f_cur, &b_cur, &f_edges, &b_edges]() {
             const uint8_t *cur = chunk_starts[t];
             const uint8_t *cend = chunk_ends[t];
-            Edge32 *out = raw_edges + start_positions[t];
-            size_t idx = 0;
             while (cur < cend) {
                 uint32_t u, v, w;
                 cur = fast_parse_u32(cur, &u); cur++;
@@ -245,60 +261,24 @@ int main(int argc, char **argv) {
                 cur = fast_parse_u32(cur, &w);
                 if (cur < cend && *cur == '\r') cur++;
                 if (cur < cend && *cur == '\n') cur++;
-                out[idx++] = {u, v, w};
+                uint32_t pos_f = f_cur[u].fetch_add(1, std::memory_order_relaxed);
+                f_edges[pos_f] = {v, w};
+                uint32_t pos_b = b_cur[v].fetch_add(1, std::memory_order_relaxed);
+                b_edges[pos_b] = {u, w};
             }
         });
     }
     for (auto &w : workers) w.join();
     workers.clear();
 
+    std::vector<std::atomic<uint32_t>>().swap(f_cur);
+    std::vector<std::atomic<uint32_t>>().swap(b_cur);
+
 #if defined(__linux__)
     posix_fadvise(g_fd, 0, g_size, POSIX_FADV_DONTNEED);
 #endif
     munmap((void *)g_data, g_size);
     close(g_fd);
-
-    // 3. Count out-degrees
-    std::vector<uint32_t> f_offsets(num_nodes + 2, 0);
-    for (size_t i = 0; i < num_edges; i++) {
-        f_offsets[raw_edges[i].u + 1]++;
-    }
-    for (uint32_t i = 0; i <= num_nodes; i++) {
-        f_offsets[i + 1] += f_offsets[i];
-    }
-
-    std::vector<uint32_t> cur_f = f_offsets;
-    std::vector<Edge> f_edges(num_edges);
-
-    for (size_t i = 0; i < num_edges; i++) {
-        uint32_t u = raw_edges[i].u;
-        f_edges[cur_f[u]++] = {raw_edges[i].v, raw_edges[i].w};
-    }
-
-    // Now build backward CSR directly from f_edges, WITHOUT raw_edges!
-    // Free raw_edges right now before allocating b_edges!
-    munmap(raw_edges, raw_edge_bytes);
-
-    std::vector<uint32_t> b_offsets(num_nodes + 2, 0);
-    for (size_t i = 0; i < num_edges; i++) {
-        b_offsets[f_edges[i].target + 1]++;
-    }
-    for (uint32_t i = 0; i <= num_nodes; i++) {
-        b_offsets[i + 1] += b_offsets[i];
-    }
-
-    std::vector<uint32_t> cur_b = b_offsets;
-    std::vector<Edge> b_edges(num_edges);
-
-    for (uint32_t u = 0; u < num_nodes; u++) {
-        uint32_t start_idx = f_offsets[u];
-        uint32_t end_idx = f_offsets[u + 1];
-        for (uint32_t e = start_idx; e < end_idx; e++) {
-            uint32_t v = f_edges[e].target;
-            uint32_t w = f_edges[e].weight;
-            b_edges[cur_b[v]++] = {u, w};
-        }
-    }
 
 #if defined(__linux__)
     malloc_trim(0);

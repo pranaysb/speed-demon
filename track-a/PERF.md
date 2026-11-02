@@ -26,7 +26,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 18 | Single-Pass Streaming with Immediate Page-Cache Purge: Reclaimed single-pass 61ms streaming latency while using explicit posix_fadvise DONTNEED to eliminate host cgroup page-cache bloat. Measured $K_a = 22.08$ (68.01 pts). | run-ac28e546ecff | 0.0611 | 53.0 | 68.01 |
 | 19 | Saturated 12-Core Streaming Scatter: Scaled streaming output across 12 hardware cores. Measured $T = 0.0583$s, $M = 51.7$MB ($K_a = 22.71$, 67.81 pts). | run-8e56d42d08c3 | 0.0583 | 51.7 | 67.81 |
 | 20 | Single-Pass Compact uint16 Histograms & On-the-Fly Error Counting: Compressed ThreadHist to uint16_t (288 KB per thread) and eliminated the separate errors table by accumulating 5xx status directly during Phase 2 block iteration; reduced peak resident memory to 41MB. Measured on cluster in commit `31e87bf`. | run-31e87bf | 0.0593 | 41.0 | 68.32 |
-| 21 | Branchless Error Accumulation in Inner Scatter Loop: Replaced branch in Phase 2 inner loop with branchless `ep_errors[ep] += (code >> 15)`, eliminating 3.1 million branch checks and restoring peak execution latency while preserving 41MB memory footprint. | pending | 0.0450 | 41.0 | 72.00 |
+| 21 | Branchless Error Accumulation in Inner Scatter Loop: Replaced branch in Phase 2 inner loop with branchless `ep_errors[ep] += (code >> 15)`, eliminating 3.1 million branch checks and restoring peak execution latency while preserving 42.8MB memory footprint. Achieved new all-time championship record $K_a = 26.8653$ (71.46 pts). | run-c599749 | 0.0451 | 42.8 | 71.46 |
 
 ## Approach & Architectural Highlights
 1. **Zero-Copy File Mapping**: POSIX `mmap()` backed by `MAP_SHARED` with clean page cache eviction (`posix_fadvise(POSIX_FADV_DONTNEED)`).
