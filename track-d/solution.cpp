@@ -9,7 +9,6 @@
 #include <algorithm>
 #include <vector>
 #include <thread>
-#include <atomic>
 #include <chrono>
 
 #if defined(__linux__)
@@ -19,6 +18,12 @@
 struct Edge {
     uint32_t target;
     uint32_t weight;
+};
+
+struct Edge32 {
+    uint32_t u;
+    uint32_t v;
+    uint32_t w;
 };
 
 struct HeapItem {
@@ -144,10 +149,45 @@ static inline char* fast_i64(char *p, int64_t v) {
     return p;
 }
 
+void radix_sort_edges_u(Edge32 *arr, Edge32 *tmp, size_t n) {
+    uint32_t count0[2048] = {0};
+    uint32_t count1[2048] = {0};
+    for (size_t i = 0; i < n; i++) {
+        count0[arr[i].u & 0x7FF]++;
+        count1[(arr[i].u >> 11) & 0x7FF]++;
+    }
+    uint32_t off0[2048], off1[2048];
+    off0[0] = 0; off1[0] = 0;
+    for (int i = 1; i < 2048; i++) {
+        off0[i] = off0[i-1] + count0[i-1];
+        off1[i] = off1[i-1] + count1[i-1];
+    }
+    for (size_t i = 0; i < n; i++) tmp[off0[arr[i].u & 0x7FF]++] = arr[i];
+    for (size_t i = 0; i < n; i++) arr[off1[(tmp[i].u >> 11) & 0x7FF]++] = tmp[i];
+}
+
+void radix_sort_edges_v(Edge32 *arr, Edge32 *tmp, size_t n) {
+    uint32_t count0[2048] = {0};
+    uint32_t count1[2048] = {0};
+    for (size_t i = 0; i < n; i++) {
+        count0[arr[i].v & 0x7FF]++;
+        count1[(arr[i].v >> 11) & 0x7FF]++;
+    }
+    uint32_t off0[2048], off1[2048];
+    off0[0] = 0; off1[0] = 0;
+    for (int i = 1; i < 2048; i++) {
+        off0[i] = off0[i-1] + count0[i-1];
+        off1[i] = off1[i-1] + count1[i-1];
+    }
+    for (size_t i = 0; i < n; i++) tmp[off0[arr[i].v & 0x7FF]++] = arr[i];
+    for (size_t i = 0; i < n; i++) arr[off1[(tmp[i].v >> 11) & 0x7FF]++] = tmp[i];
+}
+
 int main(int argc, char **argv) {
 #if defined(__linux__)
     mallopt(M_ARENA_MAX, 1);
 #endif
+    auto t_start = std::chrono::high_resolution_clock::now();
 
     const char *data_dir = "/data";
     const char *out_dir = "/out";
@@ -179,9 +219,7 @@ int main(int argc, char **argv) {
     const uint8_t *edges_end = g_data + g_size;
     size_t total_bytes = edges_end - edges_start;
 
-    unsigned int num_threads = std::thread::hardware_concurrency();
-    if (num_threads == 0) num_threads = 4;
-    if (num_threads > 12) num_threads = 12;
+    unsigned int num_threads = std::clamp(std::thread::hardware_concurrency(), 1u, 12u);
 
     std::vector<const uint8_t *> chunk_starts(num_threads);
     std::vector<const uint8_t *> chunk_ends(num_threads);
@@ -196,58 +234,24 @@ int main(int argc, char **argv) {
     }
     chunk_ends[num_threads - 1] = edges_end;
 
-    std::vector<std::atomic<uint32_t>> f_offsets_atomic(num_nodes + 1);
-    std::vector<std::atomic<uint32_t>> b_offsets_atomic(num_nodes + 1);
-    for (uint32_t i = 0; i <= num_nodes; i++) {
-        f_offsets_atomic[i].store(0, std::memory_order_relaxed);
-        b_offsets_atomic[i].store(0, std::memory_order_relaxed);
+    // Sized buffers per thread (max edges per thread <= (num_edges / num_threads) + 50000)
+    size_t max_edges_per_thread = (num_edges / num_threads) + 50000;
+    std::vector<Edge32 *> thread_buffers(num_threads);
+    std::vector<size_t> thread_counts(num_threads, 0);
+    size_t tbuf_bytes = max_edges_per_thread * sizeof(Edge32);
+
+    for (unsigned int t = 0; t < num_threads; t++) {
+        thread_buffers[t] = (Edge32 *)mmap(NULL, tbuf_bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
     }
 
+    // Single-pass parsing directly into thread_buffers
     std::vector<std::thread> workers;
     for (unsigned int t = 0; t < num_threads; t++) {
-        workers.emplace_back([t, &chunk_starts, &chunk_ends, &f_offsets_atomic, &b_offsets_atomic]() {
+        workers.emplace_back([t, &chunk_starts, &chunk_ends, &thread_buffers, &thread_counts]() {
             const uint8_t *cur = chunk_starts[t];
             const uint8_t *cend = chunk_ends[t];
-            while (cur < cend) {
-                uint32_t u, v;
-                cur = fast_parse_u32(cur, &u); cur++;
-                cur = fast_parse_u32(cur, &v);
-                f_offsets_atomic[u + 1].fetch_add(1, std::memory_order_relaxed);
-                b_offsets_atomic[v + 1].fetch_add(1, std::memory_order_relaxed);
-                while (cur < cend && *cur != '\n') cur++;
-                if (cur < cend) cur++;
-            }
-        });
-    }
-    for (auto &w : workers) w.join();
-    workers.clear();
-
-    std::vector<uint32_t> f_offsets(num_nodes + 1, 0);
-    std::vector<uint32_t> b_offsets(num_nodes + 1, 0);
-    uint32_t f_tot = 0, b_tot = 0;
-    for (uint32_t i = 0; i <= num_nodes; i++) {
-        f_tot += f_offsets_atomic[i].load(std::memory_order_relaxed);
-        b_tot += b_offsets_atomic[i].load(std::memory_order_relaxed);
-        f_offsets[i] = f_tot;
-        b_offsets[i] = b_tot;
-    }
-    std::vector<std::atomic<uint32_t>>().swap(f_offsets_atomic);
-    std::vector<std::atomic<uint32_t>>().swap(b_offsets_atomic);
-
-    std::vector<std::atomic<uint32_t>> f_cur(num_nodes);
-    std::vector<std::atomic<uint32_t>> b_cur(num_nodes);
-    for (uint32_t i = 0; i < num_nodes; i++) {
-        f_cur[i].store(f_offsets[i], std::memory_order_relaxed);
-        b_cur[i].store(b_offsets[i], std::memory_order_relaxed);
-    }
-
-    std::vector<Edge> f_edges(num_edges);
-    std::vector<Edge> b_edges(num_edges);
-
-    for (unsigned int t = 0; t < num_threads; t++) {
-        workers.emplace_back([t, &chunk_starts, &chunk_ends, &f_cur, &b_cur, &f_edges, &b_edges]() {
-            const uint8_t *cur = chunk_starts[t];
-            const uint8_t *cend = chunk_ends[t];
+            Edge32 *buf = thread_buffers[t];
+            size_t count = 0;
             while (cur < cend) {
                 uint32_t u, v, w;
                 cur = fast_parse_u32(cur, &u); cur++;
@@ -255,27 +259,84 @@ int main(int argc, char **argv) {
                 cur = fast_parse_u32(cur, &w);
                 if (cur < cend && *cur == '\r') cur++;
                 if (cur < cend && *cur == '\n') cur++;
-                uint32_t pos_f = f_cur[u].fetch_add(1, std::memory_order_relaxed);
-                f_edges[pos_f] = {v, w};
-                uint32_t pos_b = b_cur[v].fetch_add(1, std::memory_order_relaxed);
-                b_edges[pos_b] = {u, w};
+                buf[count++] = {u, v, w};
             }
+            thread_counts[t] = count;
         });
     }
     for (auto &w : workers) w.join();
     workers.clear();
 
-    std::vector<std::atomic<uint32_t>>().swap(f_cur);
-    std::vector<std::atomic<uint32_t>>().swap(b_cur);
-
-    // Unmap graph.txt immediately
-    madvise((void *)g_data, g_size, MADV_DONTNEED);
+    // Purge graph.txt from page cache immediately
+#if defined(__linux__)
+    posix_fadvise(g_fd, 0, g_size, POSIX_FADV_DONTNEED);
+#endif
     munmap((void *)g_data, g_size);
     close(g_fd);
+
+    // Flat combined raw_edges & tmp_edges for radix sort
+    size_t raw_edge_bytes = (size_t)num_edges * sizeof(Edge32);
+    Edge32 *raw_edges = (Edge32 *)mmap(NULL, raw_edge_bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+    Edge32 *tmp_edges = (Edge32 *)mmap(NULL, raw_edge_bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+
+    // Fast parallel copy from thread_buffers to raw_edges
+    size_t start_pos = 0;
+    std::vector<size_t> start_positions(num_threads, 0);
+    for (unsigned int t = 0; t < num_threads; t++) {
+        start_positions[t] = start_pos;
+        start_pos += thread_counts[t];
+    }
+
+    for (unsigned int t = 0; t < num_threads; t++) {
+        workers.emplace_back([t, &thread_buffers, &thread_counts, &start_positions, raw_edges, tbuf_bytes]() {
+            memcpy(raw_edges + start_positions[t], thread_buffers[t], thread_counts[t] * sizeof(Edge32));
+            munmap(thread_buffers[t], tbuf_bytes);
+        });
+    }
+    for (auto &w : workers) w.join();
+    workers.clear();
+
+    // Forward CSR construction via Radix Sort on u
+    std::vector<uint32_t> f_offsets(num_nodes + 1, 0);
+    std::vector<Edge> f_edges(num_edges);
+
+    radix_sort_edges_u(raw_edges, tmp_edges, num_edges);
+
+    uint32_t cur_u = 0;
+    for (size_t i = 0; i < num_edges; i++) {
+        f_edges[i] = {raw_edges[i].v, raw_edges[i].w};
+        while (cur_u < raw_edges[i].u) {
+            f_offsets[++cur_u] = (uint32_t)i;
+        }
+    }
+    while (cur_u <= num_nodes) f_offsets[cur_u++] = (uint32_t)num_edges;
+
+    // Backward CSR construction via Radix Sort on v
+    std::vector<uint32_t> b_offsets(num_nodes + 1, 0);
+    std::vector<Edge> b_edges(num_edges);
+
+    radix_sort_edges_v(raw_edges, tmp_edges, num_edges);
+
+    uint32_t cur_v = 0;
+    for (size_t i = 0; i < num_edges; i++) {
+        b_edges[i] = {raw_edges[i].u, raw_edges[i].w};
+        while (cur_v < raw_edges[i].v) {
+            b_offsets[++cur_v] = (uint32_t)i;
+        }
+    }
+    while (cur_v <= num_nodes) b_offsets[cur_v++] = (uint32_t)num_edges;
+
+    // Free raw_edges and tmp_edges immediately!
+    munmap(raw_edges, raw_edge_bytes);
+    munmap(tmp_edges, raw_edge_bytes);
 
 #if defined(__linux__)
     malloc_trim(0);
 #endif
+
+    auto t_graph_done = std::chrono::high_resolution_clock::now();
+    double d_graph = std::chrono::duration<double, std::milli>(t_graph_done - t_start).count();
+    printf("Single-pass Graph Ingestion completed in: %.2f ms\n", d_graph);
 
     // Read queries
     char queries_path[1024];
@@ -298,14 +359,15 @@ int main(int argc, char **argv) {
         if (p < q_end && *p == '\n') p++;
         queries.push_back(q_item);
     }
-    madvise((void *)q_data, q_size, MADV_DONTNEED);
+#if defined(__linux__)
+    posix_fadvise(q_fd, 0, q_size, POSIX_FADV_DONTNEED);
+#endif
     munmap((void *)q_data, q_size);
     close(q_fd);
 
     size_t num_queries = queries.size();
     std::vector<int64_t> answers(num_queries, -1);
 
-    // Dynamic work-stealing queue using full hardware concurrency
     std::atomic<size_t> next_qid{0};
     unsigned int query_threads = num_threads;
 
@@ -352,9 +414,8 @@ int main(int argc, char **argv) {
                                 if (map_f.update(v, nd)) {
                                     pq_f.push(nd, v);
                                     uint64_t bd = map_b.get(v);
-                                    if (bd != UINT64_MAX) {
-                                        uint64_t cand = nd + bd;
-                                        if (cand < best_dist) best_dist = cand;
+                                    if (bd != UINT64_MAX && nd + bd < best_dist) {
+                                        best_dist = nd + bd;
                                     }
                                 }
                             }
@@ -372,10 +433,9 @@ int main(int argc, char **argv) {
 
                                 if (map_b.update(v, nd)) {
                                     pq_b.push(nd, v);
-                                    uint64_t fd = map_f.get(v);
-                                    if (fd != UINT64_MAX) {
-                                        uint64_t cand = nd + fd;
-                                        if (cand < best_dist) best_dist = cand;
+                                    uint64_t fd_dist = map_f.get(v);
+                                    if (fd_dist != UINT64_MAX && nd + fd_dist < best_dist) {
+                                        best_dist = nd + fd_dist;
                                     }
                                 }
                             }
@@ -393,22 +453,26 @@ int main(int argc, char **argv) {
     }
     for (auto &w : workers) w.join();
 
-    mkdir(out_dir, 0777);
+    // Write output
     char out_path[1024];
     snprintf(out_path, sizeof(out_path), "%s/distances.txt", out_dir);
-
     FILE *fout = fopen(out_path, "wb");
+    if (!fout) { perror("fopen distances.txt"); return 1; }
     char *out_buf = (char *)malloc(1024 * 1024);
     setvbuf(fout, out_buf, _IOFBF, 1024 * 1024);
 
-    char line_buf[32];
+    char line_buf[64];
     for (size_t qid = 0; qid < num_queries; qid++) {
-        char *cur = fast_i64(line_buf, answers[qid]);
-        *cur++ = '\n';
-        fwrite(line_buf, 1, cur - line_buf, fout);
+        char *ptr = fast_i64(line_buf, answers[qid]);
+        *ptr++ = '\n';
+        fwrite(line_buf, 1, ptr - line_buf, fout);
     }
     fclose(fout);
     free(out_buf);
+
+    auto t_all_done = std::chrono::high_resolution_clock::now();
+    double d_all = std::chrono::duration<double, std::milli>(t_all_done - t_start).count();
+    printf("Total Track D Time: %.2f ms\n", d_all);
 
     return 0;
 }

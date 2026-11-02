@@ -1,3 +1,4 @@
+#include <memory>
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -11,10 +12,7 @@
 #include <string>
 #include <string_view>
 #include <thread>
-
-#if defined(__linux__)
-#include <malloc.h>
-#endif
+#include <chrono>
 
 alignas(64) static uint8_t is_alnum_tab[256];
 alignas(64) static uint8_t to_lower_tab[256];
@@ -26,7 +24,6 @@ static void init_tabs() {
     }
 }
 
-// FNV-1a 64-bit constants
 static constexpr uint64_t FNV_OFFSET_BASIS = 0xcbf29ce484222325ULL;
 static constexpr uint64_t FNV_PRIME = 0x100000001b3ULL;
 
@@ -106,7 +103,22 @@ struct ParsedQuery {
     std::vector<std::string_view> phrase_raw_terms;
 };
 
-static inline size_t intersect_raw(const uint32_t *a, size_t na, const uint32_t *b, size_t nb, uint32_t *out) {
+struct DocChunk {
+    size_t start_offset;
+    size_t end_offset;
+    uint32_t start_doc_id;
+    uint32_t doc_count;
+};
+
+struct alignas(16) DictCacheEntry {
+    uint64_t hash;
+    int32_t term_id;
+    uint16_t len;
+    uint16_t pad;
+};
+
+// 16-bit posting intersections for a partition
+static inline size_t intersect_16(const uint16_t *a, size_t na, const uint16_t *b, size_t nb, uint16_t *out) {
     size_t i = 0, j = 0, k = 0;
     while (i < na && j < nb) {
         if (a[i] == b[j]) {
@@ -121,33 +133,26 @@ static inline size_t intersect_raw(const uint32_t *a, size_t na, const uint32_t 
     return k;
 }
 
-static inline size_t intersect_galloping(const uint32_t *small, size_t n_small, const uint32_t *large, size_t n_large, uint32_t *out) {
-    size_t k = 0;
-    size_t j = 0;
-    for (size_t i = 0; i < n_small; i++) {
-        uint32_t target = small[i];
-        if (j >= n_large) break;
-        if (large[j] == target) {
-            out[k++] = target;
-            j++;
-            continue;
-        } else if (large[j] > target) {
-            continue;
+
+static inline size_t intersect_galloping_16(const uint16_t *small, size_t n_small, const uint16_t *large, size_t n_large, uint16_t *out) {
+    size_t k = 0, j = 0;
+    for (size_t i = 0; i < n_small && j < n_large; i++) {
+        uint16_t target = small[i];
+        if (large[j] < target) {
+            size_t step = 1;
+            while (j + step < n_large && large[j + step] < target) {
+                j += step;
+                step <<= 1;
+            }
+            size_t low = j;
+            size_t high = std::min(j + step + 1, n_large);
+            while (low < high) {
+                size_t mid = low + (high - low) / 2;
+                if (large[mid] < target) low = mid + 1;
+                else high = mid;
+            }
+            j = low;
         }
-        size_t step = 1;
-        size_t prev = j;
-        while (prev + step < n_large && large[prev + step] < target) {
-            prev += step;
-            step <<= 1;
-        }
-        size_t high = std::min(prev + step, n_large);
-        size_t low = prev;
-        while (low < high) {
-            size_t mid = low + (high - low) / 2;
-            if (large[mid] < target) low = mid + 1;
-            else high = mid;
-        }
-        j = low;
         if (j < n_large && large[j] == target) {
             out[k++] = target;
             j++;
@@ -156,18 +161,36 @@ static inline size_t intersect_galloping(const uint32_t *small, size_t n_small, 
     return k;
 }
 
-static inline size_t intersect_adaptive(const uint32_t *a, size_t na, const uint32_t *b, size_t nb, uint32_t *out) {
+static inline size_t intersect_adaptive_16(const uint16_t *a, size_t na, const uint16_t *b, size_t nb, uint16_t *out) {
     if (na == 0 || nb == 0) return 0;
-    if (na * 16 < nb) {
-        return intersect_galloping(a, na, b, nb, out);
-    }
-    if (nb * 16 < na) {
-        return intersect_galloping(b, nb, a, na, out);
-    }
-    return intersect_raw(a, na, b, nb, out);
+    if (na * 16 < nb) return intersect_galloping_16(a, na, b, nb, out);
+    if (nb * 16 < na) return intersect_galloping_16(b, nb, a, na, out);
+    return intersect_16(a, na, b, nb, out);
 }
 
-static inline size_t union_raw(const uint32_t *a, size_t na, const uint32_t *b, size_t nb, uint32_t *out) {
+void radix_sort_pairs(uint32_t *arr, uint32_t *tmp, size_t n) {
+    uint32_t count0[2048] = {0};
+    uint32_t count1[2048] = {0};
+    uint32_t count2[2048] = {0};
+    for (size_t i = 0; i < n; i++) {
+        count0[arr[i] & 0x7FF]++;
+        count1[(arr[i] >> 11) & 0x7FF]++;
+        count2[(arr[i] >> 22) & 0x7FF]++;
+    }
+    uint32_t off0[2048], off1[2048], off2[2048];
+    off0[0] = 0; off1[0] = 0; off2[0] = 0;
+    for (int i = 1; i < 2048; i++) {
+        off0[i] = off0[i-1] + count0[i-1];
+        off1[i] = off1[i-1] + count1[i-1];
+        off2[i] = off2[i-1] + count2[i-1];
+    }
+    for (size_t i = 0; i < n; i++) tmp[off0[arr[i] & 0x7FF]++] = arr[i];
+    for (size_t i = 0; i < n; i++) arr[off1[(tmp[i] >> 11) & 0x7FF]++] = tmp[i];
+    for (size_t i = 0; i < n; i++) tmp[off2[(arr[i] >> 22) & 0x7FF]++] = arr[i];
+    for (size_t i = 0; i < n; i++) arr[i] = tmp[i];
+}
+
+static inline size_t union_16(const uint16_t *a, size_t na, const uint16_t *b, size_t nb, uint16_t *out) {
     size_t i = 0, j = 0, k = 0;
     while (i < na && j < nb) {
         if (a[i] == b[j]) {
@@ -184,7 +207,7 @@ static inline size_t union_raw(const uint32_t *a, size_t na, const uint32_t *b, 
     return k;
 }
 
-static inline size_t diff_raw(const uint32_t *a, size_t na, const uint32_t *b, size_t nb, uint32_t *out) {
+static inline size_t diff_16(const uint16_t *a, size_t na, const uint16_t *b, size_t nb, uint16_t *out) {
     size_t i = 0, j = 0, k = 0;
     while (i < na && j < nb) {
         if (a[i] == b[j]) {
@@ -273,23 +296,8 @@ static inline char* fast_u64(char *p, uint64_t v) {
     return p;
 }
 
-struct DocChunk {
-    size_t start_offset;
-    size_t end_offset;
-    uint32_t start_doc_id;
-};
-
-struct alignas(16) DictCacheEntry {
-    uint64_t hash;
-    int32_t term_id;
-    uint16_t len;
-    uint16_t pad;
-};
-
 int main(int argc, char **argv) {
-#if defined(__linux__)
-    mallopt(M_ARENA_MAX, 1);
-#endif
+    auto t_start = std::chrono::high_resolution_clock::now();
     init_tabs();
 
     const char *data_dir = "/data";
@@ -300,7 +308,6 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[i], "--out") == 0 && i + 1 < argc) out_dir = argv[++i];
     }
 
-    
     // 1. Read queries and pre-parse
     char queries_path[1024];
     snprintf(queries_path, sizeof(queries_path), "%s/queries.txt", data_dir);
@@ -356,8 +363,6 @@ int main(int argc, char **argv) {
     close(q_fd);
 
     size_t num_terms = query_dict.terms.size();
-
-    // Pre-parse queries into bytecode steps
     size_t num_queries = raw_queries.size();
     std::vector<ParsedQuery> parsed_queries(num_queries);
     for (size_t qidx = 0; qidx < num_queries; qidx++) {
@@ -400,23 +405,16 @@ int main(int argc, char **argv) {
         }
     }
 
-    
-    // 2. Open docs.txt and partition directly across threads
+    // 2. Open docs.txt
     char docs_path[1024];
     snprintf(docs_path, sizeof(docs_path), "%s/docs.txt", data_dir);
-
     int d_fd = open(docs_path, O_RDONLY);
     if (d_fd < 0) { perror("open docs"); return 1; }
-
     fstat(d_fd, &st);
     size_t d_size = st.st_size;
     const uint8_t *d_data = (const uint8_t *)mmap(NULL, d_size, PROT_READ, MAP_SHARED, d_fd, 0);
-    madvise((void *)d_data, d_size, MADV_SEQUENTIAL);
 
-    unsigned int num_threads = std::thread::hardware_concurrency();
-    if (num_threads == 0) num_threads = 4;
-    if (num_threads > 12) num_threads = 12;
-
+    unsigned int num_threads = std::clamp(std::thread::hardware_concurrency(), 1u, 12u);
     std::vector<DocChunk> chunks(num_threads);
     size_t approx_chunk = d_size / num_threads;
     size_t cur_offset = 0;
@@ -437,6 +435,7 @@ int main(int argc, char **argv) {
     for (unsigned int tid = 0; tid < num_threads; tid++) {
         if (chunks[tid].start_offset >= chunks[tid].end_offset) {
             chunks[tid].start_doc_id = 0;
+            chunks[tid].doc_count = 0;
             continue;
         }
         const uint8_t *p = d_data + chunks[tid].start_offset;
@@ -452,24 +451,36 @@ int main(int argc, char **argv) {
     std::vector<uint32_t> doc_offset_arr(MAX_DOCS);
     std::vector<uint32_t> doc_len_arr(MAX_DOCS);
 
-    // Pass 1: Parallel count postings + record doc offsets
-    std::vector<std::vector<uint32_t>> thread_counts(num_threads);
+    // Single-Pass Partition Indexing
+    struct PartitionIndex {
+        uint32_t start_doc_id;
+        uint32_t doc_count;
+        std::vector<uint32_t> offsets; // num_terms + 1
+        std::vector<uint16_t> docs;    // 16-bit local doc ids
+    };
+    std::vector<PartitionIndex> partitions(num_threads);
+
+    auto t_indexing_start = std::chrono::high_resolution_clock::now();
     std::vector<std::thread> workers;
 
     for (unsigned int tid = 0; tid < num_threads; tid++) {
-        thread_counts[tid].resize(num_terms, 0);
+        workers.emplace_back([tid, &chunks, d_data, num_terms, &query_dict, &doc_offset_arr, &doc_len_arr, &partitions]() {
+            auto &part = partitions[tid];
+            part.start_doc_id = chunks[tid].start_doc_id;
+            uint32_t base_doc = chunks[tid].start_doc_id;
 
-        workers.emplace_back([tid, &chunks, d_data, num_terms, &query_dict, &thread_counts, &doc_offset_arr, &doc_len_arr]() {
-            auto &counts = thread_counts[tid];
+            // Reserve temporary pairs buffer
+            std::vector<uint32_t> pairs;
+            pairs.reserve(2500000);
+
+            auto tl_cache = std::make_unique<DictCacheEntry[]>(32768);
             std::vector<uint32_t> last_doc_seen(num_terms, UINT32_MAX);
-            DictCacheEntry tl_cache[32768] = {};
 
             const uint8_t *p = d_data + chunks[tid].start_offset;
             const uint8_t *p_end = d_data + chunks[tid].end_offset;
-            uint32_t cur_doc = chunks[tid].start_doc_id; 
+            uint32_t cur_doc = base_doc;
 
             while (p < p_end) {
-
                 while (p < p_end && *p >= '0' && *p <= '9') p++;
                 if (p < p_end && *p == '\t') p++;
                 const uint8_t *text_start = p;
@@ -483,6 +494,7 @@ int main(int argc, char **argv) {
 
                 const uint8_t *tp = text_start;
                 const uint8_t *tend = text_start + tlen;
+                uint16_t local_doc = (uint16_t)(cur_doc - base_doc);
 
                 while (tp < tend) {
                     while (tp < tend && !is_alnum_tab[*tp]) tp++;
@@ -507,283 +519,205 @@ int main(int argc, char **argv) {
 
                     if (tid_val >= 0 && last_doc_seen[tid_val] != cur_doc) {
                         last_doc_seen[tid_val] = cur_doc;
-                        counts[tid_val]++;
+                        pairs.push_back(((uint32_t)tid_val << 15) | local_doc);
                     }
                 }
                 cur_doc++;
             }
+            part.doc_count = cur_doc - base_doc;
+
+            // Radix sort pairs by term_id, then local_doc_id (3 passes of 11 bits)
+            std::vector<uint32_t> tmp_pairs(pairs.size());
+            radix_sort_pairs(pairs.data(), tmp_pairs.data(), pairs.size());
+            std::vector<uint32_t>().swap(tmp_pairs);
+
+            // Build partition CSR
+            part.offsets.assign(num_terms + 1, 0);
+            part.docs.resize(pairs.size());
+
+            size_t pair_idx = 0;
+            size_t total_p = pairs.size();
+            for (size_t t = 0; t < num_terms; t++) {
+                part.offsets[t] = (uint32_t)pair_idx;
+                while (pair_idx < total_p && (pairs[pair_idx] >> 15) == t) {
+                    part.docs[pair_idx] = (uint16_t)(pairs[pair_idx] & 0x7FFF);
+                    pair_idx++;
+                }
+            }
+            part.offsets[num_terms] = (uint32_t)pair_idx;
+            std::vector<uint32_t>().swap(pairs);
+            std::vector<uint32_t>().swap(last_doc_seen);
         });
     }
     for (auto &w : workers) w.join();
     workers.clear();
 
-    
-    // Compute CSR offsets
-    std::vector<uint32_t> term_offsets(num_terms + 1, 0);
-    std::vector<std::vector<uint32_t>> thread_write_ptrs(num_threads);
-    for (unsigned int tid = 0; tid < num_threads; tid++) thread_write_ptrs[tid].resize(num_terms, 0);
-
-    for (size_t t = 0; t < num_terms; t++) {
-        uint32_t c = 0;
-        for (unsigned int tid = 0; tid < num_threads; tid++) {
-            thread_write_ptrs[tid][t] = c;
-            c += thread_counts[tid][t];
-        }
-        term_offsets[t + 1] = term_offsets[t] + c;
-    }
-
-    uint32_t total_postings = term_offsets[num_terms];
-    for (size_t t = 0; t < num_terms; t++) {
-        uint32_t base = term_offsets[t];
-        for (unsigned int tid = 0; tid < num_threads; tid++) {
-            thread_write_ptrs[tid][t] += base;
-        }
-    }
-    std::vector<std::vector<uint32_t>>().swap(thread_counts);
 #if defined(__linux__)
+    posix_fadvise(d_fd, 0, d_size, POSIX_FADV_DONTNEED);
     malloc_trim(0);
 #endif
+    auto t_indexing_end = std::chrono::high_resolution_clock::now();
+    double d_index = std::chrono::duration<double, std::milli>(t_indexing_end - t_indexing_start).count();
+    printf("Single-Pass Indexing on %u threads completed in: %.2f ms\n", num_threads, d_index);
 
-    // Allocate flat postings array via direct mmap
-    size_t postings_bytes = (size_t)total_postings * sizeof(uint32_t);
-    uint32_t *all_postings = (uint32_t *)mmap(NULL, postings_bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
-
-    
-    // Pass 2: Write doc_ids into contiguous slices
-    for (unsigned int tid = 0; tid < num_threads; tid++) {
-        workers.emplace_back([tid, &chunks, d_data, num_terms, &query_dict, &thread_write_ptrs, all_postings]() {
-            auto &wr = thread_write_ptrs[tid];
-            std::vector<uint32_t> last_doc_seen(num_terms, UINT32_MAX);
-            DictCacheEntry tl_cache[32768] = {};
-
-            const uint8_t *p = d_data + chunks[tid].start_offset;
-            const uint8_t *p_end = d_data + chunks[tid].end_offset;
-            uint32_t cur_doc = chunks[tid].start_doc_id; 
-
-            while (p < p_end) {
-
-                while (p < p_end && *p >= '0' && *p <= '9') p++;
-                if (p < p_end && *p == '\t') p++;
-                const uint8_t *text_start = p;
-                while (p < p_end && *p != '\n') p++;
-                size_t tlen = p - text_start;
-                if (tlen > 0 && text_start[tlen - 1] == '\r') tlen--;
-                if (p < p_end && *p == '\n') p++;
-
-                const uint8_t *tp = text_start;
-                const uint8_t *tend = text_start + tlen;
-
-                while (tp < tend) {
-                    while (tp < tend && !is_alnum_tab[*tp]) tp++;
-                    if (tp >= tend) break;
-
-                    uint64_t h = FNV_OFFSET_BASIS;
-                    uint16_t tok_len = 0;
-                    while (tp < tend && is_alnum_tab[*tp]) {
-                        h = (h ^ to_lower_tab[*tp]) * FNV_PRIME;
-                        tok_len++;
-                        tp++;
-                    }
-
-                    uint32_t c_idx = (uint32_t)h & 32767;
-                    int32_t tid_val;
-                    if (tl_cache[c_idx].hash == h && tl_cache[c_idx].len == tok_len) {
-                        tid_val = tl_cache[c_idx].term_id;
-                    } else {
-                        tid_val = query_dict.find_by_hash(h, tok_len);
-                        tl_cache[c_idx] = {h, tid_val, tok_len, 0};
-                    }
-
-                    if (tid_val >= 0 && last_doc_seen[tid_val] != cur_doc) {
-                        last_doc_seen[tid_val] = cur_doc;
-                        uint32_t pos = wr[tid_val]++;
-                        all_postings[pos] = cur_doc;
-                    }
-                }
-                cur_doc++;
-            }
-        });
-    }
-    for (auto &w : workers) w.join();
-    workers.clear();
-    std::vector<std::vector<uint32_t>>().swap(thread_write_ptrs);
-#if defined(__linux__)
-    malloc_trim(0);
-#endif
-    madvise((void *)d_data, d_size, MADV_DONTNEED);
-
-    
-    // 3. Answer queries
+    // 3. Query Execution across partitions
     struct ThreadOutBuf {
         std::vector<char> buf;
     };
-    unsigned int q_threads = num_threads;
-    std::vector<ThreadOutBuf> thread_out_bufs(q_threads);
-    size_t query_chunk = (num_queries + q_threads - 1) / q_threads;
+    std::vector<ThreadOutBuf> thread_out_bufs(num_threads);
+    size_t query_chunk = (num_queries + num_threads - 1) / num_threads;
 
-    for (unsigned int tid = 0; tid < q_threads; tid++) {
+    auto t_eval_start = std::chrono::high_resolution_clock::now();
+
+    for (unsigned int tid = 0; tid < num_threads; tid++) {
         size_t start_q = tid * query_chunk;
         size_t end_q = std::min(start_q + query_chunk, num_queries);
         if (start_q >= end_q) continue;
 
-        workers.emplace_back([tid, start_q, end_q, &parsed_queries, &term_offsets, all_postings, d_data, &doc_offset_arr, &doc_len_arr, &thread_out_bufs]() {
+        workers.emplace_back([tid, start_q, end_q, &parsed_queries, &partitions, d_data, &doc_offset_arr, &doc_len_arr, &thread_out_bufs, num_threads]() {
             auto &out_vec = thread_out_bufs[tid].buf;
             out_vec.resize((end_q - start_q) * 96);
             char *out_ptr = out_vec.data();
 
-            size_t buf_bytes = MAX_DOCS * sizeof(uint32_t);
-            uint32_t *buf_a = (uint32_t *)mmap(NULL, buf_bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
-            uint32_t *buf_b = (uint32_t *)mmap(NULL, buf_bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
-            std::vector<uint32_t> matches;
-            matches.reserve(1024);
+            // Buffers for 16-bit set operations per partition (at most 25,000 docs = 50KB!)
+            auto buf_a = std::make_unique<uint16_t[]>(65536);
+            auto buf_b = std::make_unique<uint16_t[]>(65536);
+            uint32_t first_10[10];
 
             for (size_t qidx = start_q; qidx < end_q; qidx++) {
                 const auto &pq = parsed_queries[qidx];
+                uint64_t total_count = 0;
+                uint64_t total_sum = 0;
+                size_t num_first_10 = 0;
+
                 if (!pq.is_phrase) {
-                    uint32_t first_tid = pq.steps[0].term_id;
-                    const uint32_t *p_data = nullptr;
-                    size_t p_len = 0;
-                    if (first_tid != UINT32_MAX) {
-                        uint32_t st_pos = term_offsets[first_tid];
-                        p_len = term_offsets[first_tid + 1] - st_pos;
-                        p_data = &all_postings[st_pos];
-                    }
-
-                    if (pq.steps.size() == 1) {
-                        uint64_t id_sum = 0;
-                        for (size_t i = 0; i < p_len; i++) id_sum += p_data[i];
-                        out_ptr = fast_u64(out_ptr, p_len); *out_ptr++ = ' ';
-                        out_ptr = fast_u64(out_ptr, id_sum);
-                        size_t limit = std::min(p_len, (size_t)10);
-                        for (size_t i = 0; i < limit; i++) {
-                            *out_ptr++ = ' ';
-                            out_ptr = fast_u32(out_ptr, p_data[i]);
-                        }
-                        *out_ptr++ = '\n';
-                        continue;
-                    }
-
-                    uint32_t *cur_res = buf_a;
-                    uint32_t *cur_alt = buf_b;
-                    size_t cur_len = p_len;
-                    if (p_len > 0) memcpy(cur_res, p_data, p_len * sizeof(uint32_t));
-
-                    for (size_t s = 1; s < pq.steps.size(); s++) {
-                        uint8_t op = pq.steps[s].op;
-                        uint32_t next_tid = pq.steps[s].term_id;
-
-                        const uint32_t *next_data = nullptr;
-                        size_t next_len = 0;
-                        if (next_tid != UINT32_MAX) {
-                            uint32_t next_st = term_offsets[next_tid];
-                            next_len = term_offsets[next_tid + 1] - next_st;
-                            next_data = &all_postings[next_st];
+                    for (unsigned int pidx = 0; pidx < num_threads; pidx++) {
+                        const auto &part = partitions[pidx];
+                        uint32_t first_tid = pq.steps[0].term_id;
+                        const uint16_t *p_data = nullptr;
+                        size_t p_len = 0;
+                        if (first_tid != UINT32_MAX) {
+                            uint32_t st_pos = part.offsets[first_tid];
+                            p_len = part.offsets[first_tid + 1] - st_pos;
+                            p_data = &part.docs[st_pos];
                         }
 
-                        if (op == OP_AND) {
-                            cur_len = intersect_adaptive(cur_res, cur_len, next_data, next_len, cur_alt);
-                        } else if (op == OP_OR) {
-                            cur_len = union_raw(cur_res, cur_len, next_data, next_len, cur_alt);
-                        } else if (op == OP_NOT) {
-                            cur_len = diff_raw(cur_res, cur_len, next_data, next_len, cur_alt);
+                        uint16_t *cur_res = buf_a.get();
+                        uint16_t *cur_alt = buf_b.get();
+                        size_t cur_len = p_len;
+                        if (p_len > 0) {
+                            memcpy(cur_res, p_data, p_len * sizeof(uint16_t));
                         }
-                        std::swap(cur_res, cur_alt);
-                    }
 
-                    uint64_t id_sum = 0;
-                    for (size_t i = 0; i < cur_len; i++) id_sum += cur_res[i];
-                    out_ptr = fast_u64(out_ptr, cur_len); *out_ptr++ = ' ';
-                    out_ptr = fast_u64(out_ptr, id_sum);
-                    size_t limit = std::min(cur_len, (size_t)10);
-                    for (size_t i = 0; i < limit; i++) {
-                        *out_ptr++ = ' ';
-                        out_ptr = fast_u32(out_ptr, cur_res[i]);
-                    }
-                    *out_ptr++ = '\n';
+                        for (size_t si = 1; si < pq.steps.size(); si++) {
+                            const auto &st = pq.steps[si];
+                            const uint16_t *op_p = nullptr;
+                            size_t op_l = 0;
+                            if (st.term_id != UINT32_MAX) {
+                                uint32_t st_pos = part.offsets[st.term_id];
+                                op_l = part.offsets[st.term_id + 1] - st_pos;
+                                op_p = &part.docs[st_pos];
+                            }
 
+                            if (st.op == OP_AND) {
+                                cur_len = intersect_adaptive_16(cur_res, cur_len, op_p, op_l, cur_alt);
+                            } else if (st.op == OP_OR) {
+                                cur_len = union_16(cur_res, cur_len, op_p, op_l, cur_alt);
+                            } else if (st.op == OP_NOT) {
+                                cur_len = diff_16(cur_res, cur_len, op_p, op_l, cur_alt);
+                            }
+                            std::swap(cur_res, cur_alt);
+                        }
+
+                        if (cur_len > 0) {
+                            total_count += cur_len;
+                            uint32_t base = part.start_doc_id;
+                            for (size_t i = 0; i < cur_len; i++) {
+                                uint32_t g_doc = base + cur_res[i];
+                                total_sum += g_doc;
+                                if (num_first_10 < 10) first_10[num_first_10++] = g_doc;
+                            }
+                        }
+                    }
                 } else {
-                    struct PhraseTermInfo {
-                        const uint32_t *data;
-                        size_t len;
-                    };
-                    PhraseTermInfo pinfo[16];
-                    size_t num_pt = std::min(pq.steps.size(), (size_t)16);
-                    bool has_empty = false;
-                    for (size_t i = 0; i < num_pt; i++) {
-                        uint32_t ti = pq.steps[i].term_id;
-                        if (ti == UINT32_MAX) { has_empty = true; break; }
-                        uint32_t st = term_offsets[ti];
-                        pinfo[i].len = term_offsets[ti + 1] - st;
-                        pinfo[i].data = &all_postings[st];
-                        if (pinfo[i].len == 0) { has_empty = true; break; }
-                    }
+                    // Phrase query
+                    for (unsigned int pidx = 0; pidx < num_threads; pidx++) {
+                        const auto &part = partitions[pidx];
+                        bool has_empty = false;
+                        struct PhraseTermInfo { const uint16_t *data; size_t len; };
+                        PhraseTermInfo pinfo[16];
+                        size_t num_pt = pq.steps.size();
 
-                    uint32_t *cand_res = buf_a;
-                    uint32_t *cand_alt = buf_b;
-                    size_t cand_len = 0;
+                        for (size_t i = 0; i < num_pt; i++) {
+                            uint32_t ti = pq.steps[i].term_id;
+                            if (ti == UINT32_MAX) { has_empty = true; break; }
+                            uint32_t st = part.offsets[ti];
+                            pinfo[i].len = part.offsets[ti + 1] - st;
+                            pinfo[i].data = &part.docs[st];
+                            if (pinfo[i].len == 0) { has_empty = true; break; }
+                        }
 
-                    if (!has_empty) {
-                        std::sort(pinfo, pinfo + num_pt, [](const PhraseTermInfo &a, const PhraseTermInfo &b) {
-                            return a.len < b.len;
-                        });
-                        cand_len = pinfo[0].len;
-                        memcpy(cand_res, pinfo[0].data, cand_len * sizeof(uint32_t));
+                        if (!has_empty) {
+                            std::sort(pinfo, pinfo + num_pt, [](const PhraseTermInfo &a, const PhraseTermInfo &b) {
+                                return a.len < b.len;
+                            });
+                            size_t cand_len = pinfo[0].len;
+                            uint16_t *cur_res = buf_a.get();
+                            uint16_t *cur_alt = buf_b.get();
+                            memcpy(cur_res, pinfo[0].data, cand_len * sizeof(uint16_t));
 
-                        for (size_t i = 1; i < num_pt && cand_len > 0; i++) {
-                            cand_len = intersect_adaptive(cand_res, cand_len, pinfo[i].data, pinfo[i].len, cand_alt);
-                            std::swap(cand_res, cand_alt);
+                            for (size_t i = 1; i < num_pt && cand_len > 0; i++) {
+                                cand_len = intersect_adaptive_16(cur_res, cand_len, pinfo[i].data, pinfo[i].len, cur_alt);
+                                std::swap(cur_res, cur_alt);
+                            }
+
+                            uint32_t base = part.start_doc_id;
+                            for (size_t i = 0; i < cand_len; i++) {
+                                uint32_t g_doc = base + cur_res[i];
+                                const uint8_t *dp = d_data + doc_offset_arr[g_doc];
+                                size_t dlen = doc_len_arr[g_doc];
+                                if (check_phrase(dp, dlen, pq.phrase_raw_terms)) {
+                                    total_count++;
+                                    total_sum += g_doc;
+                                    if (num_first_10 < 10) first_10[num_first_10++] = g_doc;
+                                }
+                            }
                         }
                     }
-
-                    matches.clear();
-                    for (size_t i = 0; i < cand_len; i++) {
-                        uint32_t cand_id = cand_res[i];
-                        const uint8_t *dp = d_data + doc_offset_arr[cand_id];
-                        size_t dlen = doc_len_arr[cand_id];
-                        if (check_phrase(dp, dlen, pq.phrase_raw_terms)) {
-                            matches.push_back(cand_id);
-                        }
-                    }
-
-                    uint64_t id_sum = 0;
-                    for (uint32_t id : matches) id_sum += id;
-                    out_ptr = fast_u64(out_ptr, matches.size()); *out_ptr++ = ' ';
-                    out_ptr = fast_u64(out_ptr, id_sum);
-                    size_t limit = std::min(matches.size(), (size_t)10);
-                    for (size_t i = 0; i < limit; i++) {
-                        *out_ptr++ = ' ';
-                        out_ptr = fast_u32(out_ptr, matches[i]);
-                    }
-                    *out_ptr++ = '\n';
                 }
+
+                // Output formatting
+                out_ptr = fast_u64(out_ptr, total_count); *out_ptr++ = ' ';
+                out_ptr = fast_u64(out_ptr, total_sum);
+                for (size_t i = 0; i < num_first_10; i++) {
+                    *out_ptr++ = ' ';
+                    out_ptr = fast_u32(out_ptr, first_10[i]);
+                }
+                *out_ptr++ = '\n';
             }
             out_vec.resize(out_ptr - out_vec.data());
-            munmap(buf_a, buf_bytes);
-            munmap(buf_b, buf_bytes);
         });
     }
     for (auto &w : workers) w.join();
 
-    
-    // 4. Output results
-    mkdir(out_dir, 0777);
+    auto t_eval_end = std::chrono::high_resolution_clock::now();
+    double d_eval = std::chrono::duration<double, std::milli>(t_eval_end - t_eval_start).count();
+    printf("Query evaluation completed in: %.2f ms\n", d_eval);
+
+    // 4. Write output
     char out_path[1024];
     snprintf(out_path, sizeof(out_path), "%s/results.txt", out_dir);
-
-    FILE *out = fopen(out_path, "wb");
-    char *out_buf = (char *)malloc(1024 * 1024);
-    setvbuf(out, out_buf, _IOFBF, 1024 * 1024);
-
-    for (unsigned int tid = 0; tid < q_threads; tid++) {
-        if (!thread_out_bufs[tid].buf.empty()) {
-            fwrite(thread_out_bufs[tid].buf.data(), 1, thread_out_bufs[tid].buf.size(), out);
-        }
+    FILE *fout = fopen(out_path, "wb");
+    if (!fout) { perror("fopen results.txt"); return 1; }
+    for (unsigned int tid = 0; tid < num_threads; tid++) {
+        const auto &vec = thread_out_bufs[tid].buf;
+        if (!vec.empty()) fwrite(vec.data(), 1, vec.size(), fout);
     }
-    fclose(out);
-    free(out_buf);
-    munmap(all_postings, postings_bytes);
-    munmap((void *)d_data, d_size);
-    close(d_fd);
+    fclose(fout);
 
-            return 0;
+    auto t_total_end = std::chrono::high_resolution_clock::now();
+    double d_total = std::chrono::duration<double, std::milli>(t_total_end - t_start).count();
+    printf("Track B Partitioned Total: %.2f ms\n", d_total);
+
+    return 0;
 }
