@@ -313,7 +313,7 @@ int main(int argc, char **argv) {
             size_t reg_limit = region_to_cid.size();
 
             // 16,384-entry direct-mapped L1 cache (64 KB)
-            static constexpr size_t L1_CAP = 16384;
+            static constexpr size_t L1_CAP = 65536;
             static constexpr size_t L1_MASK = L1_CAP - 1;
             uint32_t l1_cache[L1_CAP] = {};
 
