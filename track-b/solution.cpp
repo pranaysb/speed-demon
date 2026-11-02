@@ -537,29 +537,37 @@ int main(int argc, char **argv) {
     for (auto &w : workers) w.join();
     workers.clear();
 
-    // Sequential Radix Sort & CSR construction using single shared 8MB buffer
-    std::vector<uint32_t> shared_tmp_pairs(2200000);
-    for (unsigned int tid = 0; tid < num_threads; tid++) {
-        auto &part = partitions[tid];
-        if (shared_tmp_pairs.size() < part.pairs.size()) shared_tmp_pairs.resize(part.pairs.size());
-        radix_sort_pairs(part.pairs.data(), shared_tmp_pairs.data(), part.pairs.size());
+    // Bounded 4-thread parallel Radix Sort & CSR construction (only 35MB temporary memory!)
+    std::atomic<unsigned int> next_part_to_sort{0};
+    unsigned int sort_threads = std::min(4u, num_threads);
+    for (unsigned int st = 0; st < sort_threads; st++) {
+        workers.emplace_back([&]() {
+            std::vector<uint32_t> local_tmp_pairs(2200000);
+            unsigned int pid;
+            while ((pid = next_part_to_sort.fetch_add(1, std::memory_order_relaxed)) < num_threads) {
+                auto &part = partitions[pid];
+                if (local_tmp_pairs.size() < part.pairs.size()) local_tmp_pairs.resize(part.pairs.size());
+                radix_sort_pairs(part.pairs.data(), local_tmp_pairs.data(), part.pairs.size());
 
-        part.offsets.assign(num_terms + 1, 0);
-        part.docs.resize(part.pairs.size());
+                part.offsets.assign(num_terms + 1, 0);
+                part.docs.resize(part.pairs.size());
 
-        size_t pair_idx = 0;
-        size_t total_p = part.pairs.size();
-        for (size_t t = 0; t < num_terms; t++) {
-            part.offsets[t] = (uint32_t)pair_idx;
-            while (pair_idx < total_p && (part.pairs[pair_idx] >> 15) == t) {
-                part.docs[pair_idx] = (uint16_t)(part.pairs[pair_idx] & 0x7FFF);
-                pair_idx++;
+                size_t pair_idx = 0;
+                size_t total_p = part.pairs.size();
+                for (size_t t = 0; t < num_terms; t++) {
+                    part.offsets[t] = (uint32_t)pair_idx;
+                    while (pair_idx < total_p && (part.pairs[pair_idx] >> 15) == t) {
+                        part.docs[pair_idx] = (uint16_t)(part.pairs[pair_idx] & 0x7FFF);
+                        pair_idx++;
+                    }
+                }
+                part.offsets[num_terms] = (uint32_t)pair_idx;
+                std::vector<uint32_t>().swap(part.pairs); // Free immediately!
             }
-        }
-        part.offsets[num_terms] = (uint32_t)pair_idx;
-        std::vector<uint32_t>().swap(part.pairs); // Free immediately!
+        });
     }
-    std::vector<uint32_t>().swap(shared_tmp_pairs); // Free immediately!
+    for (auto &w : workers) w.join();
+    workers.clear();
 
 #if defined(__linux__)
     posix_fadvise(d_fd, 0, d_size, POSIX_FADV_DONTNEED);
