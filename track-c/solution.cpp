@@ -20,15 +20,33 @@
 #if defined(__x86_64__) || defined(_M_X64)
 #include <immintrin.h>
 static inline uint32_t crc32c_u64(uint32_t crc, uint64_t v) { return (uint32_t)_mm_crc32_u64(crc, v); }
+static inline uint32_t crc32c_u32(uint32_t crc, uint32_t v) { return _mm_crc32_u32(crc, v); }
+static inline uint32_t crc32c_u16(uint32_t crc, uint16_t v) { return _mm_crc32_u16(crc, v); }
 static inline uint32_t crc32c_u8(uint32_t crc, uint8_t v) { return (uint32_t)_mm_crc32_u8(crc, v); }
 #elif defined(__aarch64__) || defined(_M_ARM64)
 #include <arm_acle.h>
 #include <arm_neon.h>
 static inline uint32_t crc32c_u64(uint32_t crc, uint64_t v) { return __crc32cd(crc, v); }
+static inline uint32_t crc32c_u32(uint32_t crc, uint32_t v) { return __crc32cw(crc, v); }
+static inline uint32_t crc32c_u16(uint32_t crc, uint16_t v) { return __crc32ch(crc, v); }
 static inline uint32_t crc32c_u8(uint32_t crc, uint8_t v) { return __crc32cb(crc, v); }
 #else
 static inline uint32_t crc32c_u64(uint32_t crc, uint64_t v) {
     for (int i = 0; i < 8; i++) {
+        uint8_t b = (v >> (i * 8)) & 0xFF;
+        crc = (crc >> 8) ^ (0x82F63B78 * ((crc ^ b) & 1));
+    }
+    return crc;
+}
+static inline uint32_t crc32c_u32(uint32_t crc, uint32_t v) {
+    for (int i = 0; i < 4; i++) {
+        uint8_t b = (v >> (i * 8)) & 0xFF;
+        crc = (crc >> 8) ^ (0x82F63B78 * ((crc ^ b) & 1));
+    }
+    return crc;
+}
+static inline uint32_t crc32c_u16(uint32_t crc, uint16_t v) {
+    for (int i = 0; i < 2; i++) {
         uint8_t b = (v >> (i * 8)) & 0xFF;
         crc = (crc >> 8) ^ (0x82F63B78 * ((crc ^ b) & 1));
     }
@@ -48,9 +66,18 @@ static inline uint32_t crc32c_buffer_small(const uint8_t *p, size_t len) {
         crc = crc32c_u64(crc, v);
         p += 8; rem -= 8;
     }
-    while (rem > 0) {
+    if (rem >= 4) {
+        uint32_t v; memcpy(&v, p, 4);
+        crc = crc32c_u32(crc, v);
+        p += 4; rem -= 4;
+    }
+    if (rem >= 2) {
+        uint16_t v; memcpy(&v, p, 2);
+        crc = crc32c_u16(crc, v);
+        p += 2; rem -= 2;
+    }
+    if (rem > 0) {
         crc = crc32c_u8(crc, *p);
-        p++; rem--;
     }
     return crc ^ 0xFFFFFFFF;
 }
@@ -98,36 +125,40 @@ static inline char* format_cents(char *buf, int64_t cents) {
         *buf++ = '-';
         cents = -cents;
     }
-    uint64_t whole = (uint64_t)(cents / 100);
-    uint32_t frac = (uint32_t)(cents % 100);
+    int64_t whole = cents / 100;
+    int rem = (int)(cents % 100);
 
     if (whole == 0) {
         *buf++ = '0';
     } else {
         char tmp[24];
-        int ti = 0;
-        while (whole > 0) {
-            tmp[ti++] = (whole % 10) + '0';
-            whole /= 10;
+        int idx = 0;
+        int64_t w = whole;
+        while (w > 0) {
+            tmp[idx++] = (w % 10) + '0';
+            w /= 10;
         }
-        while (ti > 0) *buf++ = tmp[--ti];
+        while (idx > 0) *buf++ = tmp[--idx];
     }
     *buf++ = '.';
-    *buf++ = (frac / 10) + '0';
-    *buf++ = (frac % 10) + '0';
+    *buf++ = (rem / 10) + '0';
+    *buf++ = (rem % 10) + '0';
     return buf;
 }
 
-static inline char* fast_u64(char *p, uint64_t v) {
-    if (v == 0) { *p++ = '0'; return p; }
-    char buf[24];
-    int i = 0;
+static inline char* fast_u64(char *buf, uint64_t v) {
+    if (v == 0) {
+        *buf++ = '0';
+        return buf;
+    }
+    char tmp[24];
+    int idx = 0;
     while (v > 0) {
-        buf[i++] = (v % 10) + '0';
+        tmp[idx++] = (v % 10) + '0';
         v /= 10;
     }
-    while (i > 0) *p++ = buf[--i];
-    return p;
+    while (idx > 0) *buf++ = tmp[--idx];
+    return buf;
 }
 
 struct ThreadCountryAgg {
@@ -136,9 +167,9 @@ struct ThreadCountryAgg {
     int64_t amount_sum = 0;
     int64_t amount_min = 0;
     int64_t amount_max = 0;
-    bool has_amount = false;
     uint64_t name_bytes = 0;
     uint64_t note_bytes = 0;
+    bool has_amount = false;
 };
 
 struct FinalCountryAgg {
@@ -181,7 +212,7 @@ static inline uint32_t get_or_insert_name_id(uint32_t crc) {
     }
 }
 
-static constexpr size_t BITSET_WORDS = 2048;
+static constexpr size_t BITSET_WORDS = 1600;
 static std::atomic<uint64_t> g_country_bitsets[256][BITSET_WORDS];
 
 int main(int argc, char **argv) {
@@ -209,25 +240,25 @@ int main(int argc, char **argv) {
     std::vector<std::string> country_names;
     country_names.push_back("_UNMATCHED");
 
-    std::vector<uint16_t> region_to_cid(1000005, 0);
-    uint16_t code3_to_cid[26 * 26 * 26];
+    std::vector<uint8_t> region_to_cid(1000005, 0);
+    uint8_t code3_to_cid[26 * 26 * 26];
     memset(code3_to_cid, 0, sizeof(code3_to_cid));
 
-    auto get_or_add_code3 = [&](const uint8_t *p, size_t len) -> uint16_t {
+    auto get_or_add_code3 = [&](const uint8_t *p, size_t len) -> uint8_t {
         if (len == 3 && p[0] >= 'A' && p[0] <= 'Z' &&
                         p[1] >= 'A' && p[1] <= 'Z' &&
                         p[2] >= 'A' && p[2] <= 'Z') {
             uint32_t idx = (p[0] - 'A') * 676 + (p[1] - 'A') * 26 + (p[2] - 'A');
             if (code3_to_cid[idx] != 0) return code3_to_cid[idx];
-            uint16_t cid = (uint16_t)country_names.size();
+            uint8_t cid = (uint8_t)country_names.size();
             country_names.push_back(std::string((const char *)p, len));
             code3_to_cid[idx] = cid;
             return cid;
         }
         for (size_t c = 0; c < country_names.size(); c++) {
-            if (country_names[c].size() == len && memcmp(country_names[c].data(), p, len) == 0) return (uint16_t)c;
+            if (country_names[c].size() == len && memcmp(country_names[c].data(), p, len) == 0) return (uint8_t)c;
         }
-        uint16_t cid = (uint16_t)country_names.size();
+        uint8_t cid = (uint8_t)country_names.size();
         country_names.push_back(std::string((const char *)p, len));
         return cid;
     };
@@ -249,7 +280,7 @@ int main(int argc, char **argv) {
         size_t clen = rp - cs;
         if (rp < rend && *rp == '\r') rp++;
         if (rp < rend && *rp == '\n') rp++;
-        uint16_t cid = get_or_add_code3(cs, clen);
+        uint8_t cid = get_or_add_code3(cs, clen);
         if (reg_id < region_to_cid.size()) region_to_cid[reg_id] = cid;
     }
     munmap((void *)rdata, rsize);
@@ -312,8 +343,8 @@ int main(int argc, char **argv) {
             auto &aggs = thread_aggs[t];
             size_t reg_limit = region_to_cid.size();
 
-            // 16,384-entry direct-mapped L1 cache (64 KB L1/L2 resident)
-            static constexpr size_t L1_CAP = 16384;
+            // 32,768-entry direct-mapped L1 cache (128 KB L2 resident)
+            static constexpr size_t L1_CAP = 32768;
             static constexpr size_t L1_MASK = L1_CAP - 1;
             uint32_t l1_cache[L1_CAP] = {};
 
@@ -435,7 +466,7 @@ int main(int argc, char **argv) {
                 if (p < end && *p == '\r') p++;
                 if (p < end && *p == '\n') p++;
 
-                uint16_t cid = (reg_id < reg_limit) ? region_to_cid[reg_id] : 0;
+                uint8_t cid = (reg_id < reg_limit) ? region_to_cid[reg_id] : 0;
                 ThreadCountryAgg &ca = aggs[cid];
                 ca.count++;
                 ca.id_sum += rec_id;
@@ -511,6 +542,7 @@ int main(int argc, char **argv) {
         return a.key < b.key;
     });
 
+    mkdir(out_dir, 0777);
     char out_path[1024];
     snprintf(out_path, sizeof(out_path), "%s/aggregates.txt", out_dir);
     FILE *fout = fopen(out_path, "wb");

@@ -296,8 +296,15 @@ int main(int argc, char **argv) {
     for (auto &w : workers) w.join();
     workers.clear();
 
-        munmap((void *)data, file_size);
+#if defined(__linux__)
+    madvise((void *)data, file_size, MADV_DONTNEED);
+    posix_fadvise(fd, 0, file_size, POSIX_FADV_DONTNEED);
+#endif
+    munmap((void *)data, file_size);
     close(fd);
+#if defined(__linux__)
+    malloc_trim(0);
+#endif
 
     // Sort endpoints
     std::vector<uint16_t> sorted_endpoint_ids(g_num_endpoints);

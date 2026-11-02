@@ -275,6 +275,7 @@ int main(int argc, char **argv) {
     std::vector<std::atomic<uint32_t>>().swap(b_cur);
 
 #if defined(__linux__)
+    madvise((void *)g_data, g_size, MADV_DONTNEED);
     posix_fadvise(g_fd, 0, g_size, POSIX_FADV_DONTNEED);
 #endif
     munmap((void *)g_data, g_size);
@@ -308,6 +309,7 @@ int main(int argc, char **argv) {
         queries.push_back(q_item);
     }
 #if defined(__linux__)
+    madvise((void *)q_data, q_size, MADV_DONTNEED);
     posix_fadvise(q_fd, 0, q_size, POSIX_FADV_DONTNEED);
 #endif
     munmap((void *)q_data, q_size);
