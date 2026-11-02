@@ -1,4 +1,5 @@
 #include <memory>
+#include <atomic>
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -13,6 +14,10 @@
 #include <string_view>
 #include <thread>
 #include <chrono>
+
+#if defined(__linux__)
+#include <malloc.h>
+#endif
 
 alignas(64) static uint8_t is_alnum_tab[256];
 alignas(64) static uint8_t to_lower_tab[256];

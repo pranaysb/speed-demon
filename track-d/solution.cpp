@@ -9,6 +9,8 @@
 #include <algorithm>
 #include <vector>
 #include <thread>
+#include <atomic>
+#include <memory>
 #include <chrono>
 
 #if defined(__linux__)
